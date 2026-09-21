@@ -11,6 +11,11 @@ class UtMedia {
 
   static Future<void> playAlert() => _invoke<void>('playAlert');
 
+  static Future<void> playFile(String path) =>
+      _channel.invokeMethod<void>('playFile', path);
+
+  static Future<void> stopPlayback() => _invoke<void>('stopPlayback');
+
   static Future<void> haptic() => _invoke<void>('haptic');
 
   static Future<void> startRecording(String path) =>

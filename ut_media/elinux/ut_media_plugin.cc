@@ -12,6 +12,9 @@
 #ifdef UT_MEDIA_HAVE_VORBIS
 #include <vorbis/vorbisfile.h>
 #endif
+#ifdef UT_MEDIA_HAVE_OPUSFILE
+#include <opusfile.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -448,6 +451,94 @@ pa_simple* OpenCapture(int* rate_out, int* channels_out, int* error_out) {
   return nullptr;
 }
 
+void PlayBeep();  // defined below
+
+std::atomic<bool> g_playing{false};
+
+bool PlayOpusFile(const std::string& path) {
+#ifdef UT_MEDIA_HAVE_OPUSFILE
+  int err = 0;
+  OggOpusFile* of = op_open_file(path.c_str(), &err);
+  if (!of) return false;
+  const OpusHead* head = op_head(of, nullptr);
+  const int channels = head ? head->channel_count : 1;
+  pa_sample_spec ss;
+  ss.format = PA_SAMPLE_S16LE;
+  ss.rate = 48000;
+  ss.channels = static_cast<uint8_t>(std::max(1, channels));
+  int error = 0;
+  pa_simple* s = pa_simple_new(nullptr, "fluffychat", PA_STREAM_PLAYBACK, nullptr,
+                               "voice", &ss, nullptr, nullptr, &error);
+  if (!s) {
+    op_free(of);
+    return false;
+  }
+  int16_t buf[960 * 8];
+  while (g_playing.load()) {
+    const int n = op_read(of, buf, 960 * ss.channels, nullptr);
+    if (n <= 0) break;
+    if (pa_simple_write(s, buf, static_cast<size_t>(n) * ss.channels * sizeof(int16_t),
+                        &error) < 0) {
+      break;
+    }
+  }
+  if (g_playing.load()) pa_simple_drain(s, &error);
+  pa_simple_free(s);
+  op_free(of);
+  return true;
+#else
+  (void)path;
+  return false;
+#endif
+}
+
+bool PlayVorbisFile(const std::string& path) {
+#ifdef UT_MEDIA_HAVE_VORBIS
+  OggVorbis_File vf;
+  if (ov_fopen(path.c_str(), &vf) != 0) return false;
+  vorbis_info* info = ov_info(&vf, -1);
+  if (!info) {
+    ov_clear(&vf);
+    return false;
+  }
+  pa_sample_spec ss;
+  ss.format = PA_SAMPLE_S16LE;
+  ss.rate = static_cast<uint32_t>(info->rate);
+  ss.channels = static_cast<uint8_t>(info->channels);
+  int error = 0;
+  pa_simple* s = pa_simple_new(nullptr, "fluffychat", PA_STREAM_PLAYBACK, nullptr,
+                               "voice", &ss, nullptr, nullptr, &error);
+  if (!s) {
+    ov_clear(&vf);
+    return false;
+  }
+  char pcm[4096];
+  int bitstream = 0;
+  long n = 0;
+  while (g_playing.load() &&
+         (n = ov_read(&vf, pcm, sizeof(pcm), 0, 2, 1, &bitstream)) > 0) {
+    pa_simple_write(s, pcm, static_cast<size_t>(n), &error);
+  }
+  if (g_playing.load()) pa_simple_drain(s, &error);
+  pa_simple_free(s);
+  ov_clear(&vf);
+  return true;
+#else
+  (void)path;
+  return false;
+#endif
+}
+
+void PlayAudioFile(const std::string& path) {
+  g_playing = true;
+  if (!PlayOpusFile(path)) {
+    PlayVorbisFile(path);
+  }
+  g_playing = false;
+}
+
+void StopAudioFile() { g_playing = false; }
+
 void PlayBeep() {
   pa_sample_spec ss;
   ss.format = PA_SAMPLE_S16LE;
@@ -539,7 +630,10 @@ class UtMediaPlugin : public flutter::Plugin {
  public:
   static void RegisterWithRegistrar(flutter::PluginRegistrar* registrar);
   UtMediaPlugin() = default;
-  ~UtMediaPlugin() override { Cancel(); }
+  ~UtMediaPlugin() override {
+    StopAudioFile();
+    Cancel();
+  }
 
   UtMediaPlugin(const UtMediaPlugin&) = delete;
   UtMediaPlugin& operator=(const UtMediaPlugin&) = delete;
@@ -719,6 +813,22 @@ void UtMediaPlugin::HandleMethodCall(
   const auto& method = call.method_name();
   if (method == "playAlert") {
     std::thread(PlayXylo).detach();
+    result->Success(flutter::EncodableValue());
+    return;
+  }
+  if (method == "playFile") {
+    const auto* path = std::get_if<std::string>(call.arguments());
+    if (!path || path->empty()) {
+      result->Error("INVALID_ARGS", "Missing path");
+      return;
+    }
+    StopAudioFile();
+    std::thread([p = *path]() { PlayAudioFile(p); }).detach();
+    result->Success(flutter::EncodableValue());
+    return;
+  }
+  if (method == "stopPlayback") {
+    StopAudioFile();
     result->Success(flutter::EncodableValue());
     return;
   }

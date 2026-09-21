@@ -9,6 +9,7 @@ pkg_check_modules(PULSE REQUIRED libpulse libpulse-simple)
 pkg_check_modules(OPUS REQUIRED opus)
 pkg_check_modules(GLIB REQUIRED glib-2.0 gio-2.0)
 pkg_check_modules(VORBISFILE vorbisfile)
+pkg_check_modules(OPUSFILE opusfile)
 
 add_library(${PLUGIN_NAME} SHARED
   "ut_media_plugin.cc"
@@ -22,6 +23,11 @@ if(VORBISFILE_FOUND)
   target_compile_definitions(${PLUGIN_NAME} PRIVATE UT_MEDIA_HAVE_VORBIS)
   target_include_directories(${PLUGIN_NAME} PRIVATE ${VORBISFILE_INCLUDE_DIRS})
   target_link_libraries(${PLUGIN_NAME} PRIVATE ${VORBISFILE_LIBRARIES})
+endif()
+if(OPUSFILE_FOUND)
+  target_compile_definitions(${PLUGIN_NAME} PRIVATE UT_MEDIA_HAVE_OPUSFILE)
+  target_include_directories(${PLUGIN_NAME} PRIVATE ${OPUSFILE_INCLUDE_DIRS})
+  target_link_libraries(${PLUGIN_NAME} PRIVATE ${OPUSFILE_LIBRARIES})
 endif()
 
 target_include_directories(${PLUGIN_NAME} PRIVATE
