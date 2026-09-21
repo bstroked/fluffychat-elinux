@@ -112,8 +112,11 @@ patch -p1 --forward --reject-file=/dev/null \
 # app from reaching org.freedesktop.Notifications, so flutter_local_
 # notifications only ever throws AccessDenied here. Also plays Xylo+haptic
 # while the app is open, enables PulseAudio voice notes, and swipe-up-to-go-back.
-patch -p1 --forward --reject-file=/dev/null \
-    < "${ROOT}/patches/fluffychat-ut-mod.patch" 2>/dev/null || true
+if ! patch -p1 --forward --reject-file=/dev/null \
+    < "${ROOT}/patches/fluffychat-ut-mod.patch"; then
+    echo "ERROR: patches/fluffychat-ut-mod.patch failed to apply" >&2
+    exit 1
+fi
 
 # Open the room behind a URL dispatched to the app, which is what a tapped
 # notification turns into.

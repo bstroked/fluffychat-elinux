@@ -1,6 +1,9 @@
 import 'package:flutter/services.dart';
 
-/// PulseAudio + Opus voice notes, Xylo chime, and haptic on Ubuntu Touch.
+/// PulseAudio voice notes, Xylo chime, and haptic on Ubuntu Touch.
+///
+/// Capture matches Cinny’s native QAudioInput path: PCM from the phone’s
+/// default microphone at the source’s own rate, then 16 kHz SILK Opus.
 class UtMedia {
   UtMedia._();
 
@@ -11,10 +14,10 @@ class UtMedia {
   static Future<void> haptic() => _invoke<void>('haptic');
 
   static Future<void> startRecording(String path) =>
-      _invoke<void>('startRecording', path);
+      _channel.invokeMethod<void>('startRecording', path);
 
   static Future<String?> stopRecording() =>
-      _invoke<String>('stopRecording');
+      _channel.invokeMethod<String>('stopRecording');
 
   static Future<void> cancelRecording() => _invoke<void>('cancelRecording');
 

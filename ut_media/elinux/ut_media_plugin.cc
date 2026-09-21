@@ -6,6 +6,7 @@
 #include <gio/gio.h>
 #include <opus/opus.h>
 #include <pulse/error.h>
+#include <pulse/pulseaudio.h>
 #include <pulse/simple.h>
 
 #ifdef UT_MEDIA_HAVE_VORBIS
@@ -16,7 +17,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -29,9 +32,9 @@ namespace ut_media {
 namespace {
 
 constexpr char kChannelName[] = "ut_media";
-constexpr int kRate = 16000;
+constexpr int kEncoderRate = 16000;
 constexpr int kFrameMs = 20;
-constexpr int kFrameSamples = kRate * kFrameMs / 1000;
+constexpr int kFrameSamples = kEncoderRate * kFrameMs / 1000;
 constexpr int kBitrate = 20000;
 constexpr int kPreSkip = 312;
 constexpr int kGranulePerFrame = 48 * kFrameMs;
@@ -180,7 +183,7 @@ std::vector<uint8_t> OpusHead() {
   h.push_back(1);
   h.push_back(1);
   WriteU16(&h, kPreSkip);
-  WriteU32(&h, kRate);
+  WriteU32(&h, kEncoderRate);
   h.push_back(0);
   h.push_back(0);
   h.push_back(0);
@@ -188,8 +191,8 @@ std::vector<uint8_t> OpusHead() {
 }
 
 std::vector<uint8_t> OpusTags() {
-  const char* vendor = "FluffyChatUT";
-  const char* comment = "ENCODER=ut-media-pulse-opus";
+  const char* vendor = "CinnyUT";
+  const char* comment = "ENCODER=cinny-pulse-opus";
   std::vector<uint8_t> t;
   t.insert(t.end(), {'O', 'p', 'u', 's', 'T', 'a', 'g', 's'});
   WriteU32(&t, static_cast<uint32_t>(std::strlen(vendor)));
@@ -237,11 +240,55 @@ std::vector<uint8_t> BuildOgg(const std::vector<std::vector<uint8_t>>& frames) {
   return out;
 }
 
+std::vector<int16_t> ToMono16(const std::vector<int16_t>& interleaved, int ch) {
+  if (ch <= 1) return interleaved;
+  const int frames = static_cast<int>(interleaved.size()) / ch;
+  std::vector<int16_t> out(static_cast<size_t>(frames));
+  for (int i = 0; i < frames; ++i) {
+    int sum = 0;
+    for (int c = 0; c < ch; ++c) {
+      sum += interleaved[static_cast<size_t>(i * ch + c)];
+    }
+    out[static_cast<size_t>(i)] = static_cast<int16_t>(sum / ch);
+  }
+  return out;
+}
+
+std::vector<int16_t> ResampleTo16k(const std::vector<int16_t>& in, int in_rate) {
+  if (in_rate == kEncoderRate || in.empty()) return in;
+  if (in_rate == 48000) {
+    const int out_n = static_cast<int>(in.size()) / 3;
+    std::vector<int16_t> out(static_cast<size_t>(out_n));
+    for (int i = 0; i < out_n; ++i) {
+      const int s = static_cast<int>(in[static_cast<size_t>(i * 3)]) +
+                    in[static_cast<size_t>(i * 3 + 1)] +
+                    in[static_cast<size_t>(i * 3 + 2)];
+      out[static_cast<size_t>(i)] = static_cast<int16_t>(s / 3);
+    }
+    return out;
+  }
+  const int out_n = static_cast<int>(
+      (static_cast<int64_t>(in.size()) * kEncoderRate) / in_rate);
+  std::vector<int16_t> out(static_cast<size_t>(std::max(0, out_n)));
+  for (int i = 0; i < out_n; ++i) {
+    const double src = (static_cast<double>(i) * in_rate) / kEncoderRate;
+    int i0 = static_cast<int>(src);
+    int i1 = i0 + 1;
+    if (i0 >= static_cast<int>(in.size())) i0 = static_cast<int>(in.size()) - 1;
+    if (i1 >= static_cast<int>(in.size())) i1 = static_cast<int>(in.size()) - 1;
+    const double t = src - i0;
+    out[static_cast<size_t>(i)] = static_cast<int16_t>(
+        in[static_cast<size_t>(i0)] * (1.0 - t) +
+        in[static_cast<size_t>(i1)] * t);
+  }
+  return out;
+}
+
 bool EncodeOpusFile(const std::vector<int16_t>& pcm, const std::string& path) {
   if (pcm.size() < static_cast<size_t>(kFrameSamples / 2)) return false;
   int err = OPUS_OK;
   OpusEncoder* enc =
-      opus_encoder_create(kRate, 1, OPUS_APPLICATION_VOIP, &err);
+      opus_encoder_create(kEncoderRate, 1, OPUS_APPLICATION_VOIP, &err);
   if (!enc || err != OPUS_OK) {
     if (enc) opus_encoder_destroy(enc);
     return false;
@@ -249,6 +296,7 @@ bool EncodeOpusFile(const std::vector<int16_t>& pcm, const std::string& path) {
   opus_encoder_ctl(enc, OPUS_SET_BITRATE(kBitrate));
   opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(10));
   opus_encoder_ctl(enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+  opus_encoder_ctl(enc, OPUS_SET_DTX(0));
 
   std::vector<std::vector<uint8_t>> frames;
   unsigned char packet[4000];
@@ -276,6 +324,130 @@ bool EncodeOpusFile(const std::vector<int16_t>& pcm, const std::string& path) {
   return static_cast<bool>(out);
 }
 
+std::string WritableDir() {
+  const char* cache = std::getenv("XDG_CACHE_HOME");
+  if (cache && cache[0]) return cache;
+  const char* data = std::getenv("XDG_DATA_HOME");
+  if (data && data[0]) return data;
+  const char* home = std::getenv("HOME");
+  if (home && home[0]) {
+    return std::string(home) + "/.local/share/fluffychat.notkit";
+  }
+  return "/tmp";
+}
+
+struct SourceQuery {
+  pa_sample_spec spec{};
+  std::string name;
+  bool have_name = false;
+  bool have_spec = false;
+};
+
+void ServerInfoCb(pa_context* ctx, const pa_server_info* info, void* userdata) {
+  auto* q = static_cast<SourceQuery*>(userdata);
+  if (!info || !info->default_source_name) return;
+  q->name = info->default_source_name;
+  q->have_name = true;
+  pa_operation_unref(pa_context_get_source_info_by_name(
+      ctx, info->default_source_name,
+      [](pa_context*, const pa_source_info* src, int eol, void* ud) {
+        if (eol > 0) return;
+        auto* query = static_cast<SourceQuery*>(ud);
+        if (!src) return;
+        query->spec = src->sample_spec;
+        query->have_spec = true;
+      },
+      q));
+}
+
+bool QueryDefaultSource(pa_sample_spec* spec_out) {
+  pa_mainloop* ml = pa_mainloop_new();
+  if (!ml) return false;
+  pa_context* ctx =
+      pa_context_new(pa_mainloop_get_api(ml), "fluffychat-source-query");
+  if (!ctx) {
+    pa_mainloop_free(ml);
+    return false;
+  }
+  SourceQuery query;
+  pa_context_set_state_callback(
+      ctx,
+      [](pa_context* c, void* ud) {
+        if (pa_context_get_state(c) == PA_CONTEXT_READY) {
+          pa_operation_unref(
+              pa_context_get_server_info(c, ServerInfoCb, ud));
+        }
+      },
+      &query);
+  if (pa_context_connect(ctx, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
+    return false;
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!query.have_spec &&
+         std::chrono::steady_clock::now() < deadline) {
+    const pa_context_state_t st = pa_context_get_state(ctx);
+    if (st == PA_CONTEXT_FAILED || st == PA_CONTEXT_TERMINATED) break;
+    if (pa_mainloop_iterate(ml, 1, nullptr) < 0) break;
+  }
+  const bool ok = query.have_spec && query.spec.rate > 0 &&
+                  query.spec.channels > 0;
+  if (ok) *spec_out = query.spec;
+  pa_context_disconnect(ctx);
+  pa_context_unref(ctx);
+  pa_mainloop_free(ml);
+  return ok;
+}
+
+pa_simple* OpenAt(uint32_t rate, uint8_t channels, int* error_out) {
+  pa_sample_spec ss;
+  ss.format = PA_SAMPLE_S16LE;
+  ss.rate = rate;
+  ss.channels = channels;
+  pa_buffer_attr attr;
+  std::memset(&attr, 0xff, sizeof(attr));
+  const uint32_t bytes_per_sec =
+      rate * channels * static_cast<uint32_t>(sizeof(int16_t));
+  attr.fragsize = bytes_per_sec / 5;
+  int error = 0;
+  pa_simple* s =
+      pa_simple_new(nullptr, "fluffychat", PA_STREAM_RECORD, nullptr, "voice",
+                    &ss, nullptr, &attr, &error);
+  *error_out = error;
+  return s;
+}
+
+pa_simple* OpenCapture(int* rate_out, int* channels_out, int* error_out) {
+  // Cinny’s working path is Qt’s default input at the phone’s own PCM
+  // format (nearestFormat), not a forced 48 kHz Opus encode.
+  pa_sample_spec native{};
+  if (QueryDefaultSource(&native)) {
+    pa_simple* s =
+        OpenAt(native.rate, native.channels, error_out);
+    if (s) {
+      *rate_out = static_cast<int>(native.rate);
+      *channels_out = native.channels;
+      return s;
+    }
+  }
+  struct TrySpec {
+    uint32_t rate;
+    uint8_t channels;
+  };
+  const TrySpec tries[] = {{44100, 1}, {16000, 1}, {48000, 1}, {48000, 2}};
+  for (const auto& spec : tries) {
+    pa_simple* s = OpenAt(spec.rate, spec.channels, error_out);
+    if (s) {
+      *rate_out = static_cast<int>(spec.rate);
+      *channels_out = spec.channels;
+      return s;
+    }
+  }
+  return nullptr;
+}
+
 void PlayBeep() {
   pa_sample_spec ss;
   ss.format = PA_SAMPLE_S16LE;
@@ -285,7 +457,7 @@ void PlayBeep() {
   pa_simple* s = pa_simple_new(nullptr, "fluffychat", PA_STREAM_PLAYBACK, nullptr,
                                "alert", &ss, nullptr, nullptr, &error);
   if (!s) return;
-  const int n = 16000 * 12 / 100;  // 120ms
+  const int n = 16000 * 12 / 100;
   std::vector<int16_t> buf(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) {
     const double t = static_cast<double>(i) / 16000.0;
@@ -382,12 +554,18 @@ class UtMediaPlugin : public flutter::Plugin {
   void Cancel();
 
   std::mutex mu_;
+  std::condition_variable start_cv_;
   std::thread thread_;
   std::atomic<bool> running_{false};
   std::atomic<bool> paused_{false};
   std::atomic<double> amplitude_{-60.0};
   std::vector<int16_t> pcm_;
   std::string path_;
+  int capture_rate_ = kEncoderRate;
+  int capture_channels_ = 1;
+  bool start_done_ = false;
+  bool start_ok_ = false;
+  std::string start_error_;
 };
 
 void UtMediaPlugin::RegisterWithRegistrar(flutter::PluginRegistrar* registrar) {
@@ -414,35 +592,60 @@ bool UtMediaPlugin::StartRecording(const std::string& path, std::string* error) 
     pcm_.clear();
     paused_ = false;
     amplitude_ = -60.0;
+    capture_rate_ = kEncoderRate;
+    capture_channels_ = 1;
+    start_done_ = false;
+    start_ok_ = false;
+    start_error_.clear();
     running_ = true;
   }
   thread_ = std::thread([this]() {
-    pa_sample_spec ss;
-    ss.format = PA_SAMPLE_S16LE;
-    ss.rate = kRate;
-    ss.channels = 1;
+    int rate = 0;
+    int channels = 0;
     int error = 0;
-    pa_simple* s =
-        pa_simple_new(nullptr, "fluffychat", PA_STREAM_RECORD, nullptr, "voice",
-                      &ss, nullptr, nullptr, &error);
-    if (!s) {
-      running_ = false;
-      return;
+    pa_simple* s = OpenCapture(&rate, &channels, &error);
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!s) {
+        start_ok_ = false;
+        start_error_ = error ? pa_strerror(error) : "No microphone.";
+        start_done_ = true;
+        running_ = false;
+      } else {
+        capture_rate_ = rate;
+        capture_channels_ = channels;
+        start_ok_ = true;
+        start_done_ = true;
+      }
     }
-    int16_t buf[kFrameSamples];
-    const int max_samples = kRate * kMaxSeconds;
+    start_cv_.notify_one();
+    if (!s) return;
+
+    const int frame_samples = std::max(1, rate * kFrameMs / 1000);
+    const int read_samples = frame_samples * channels;
+    std::vector<int16_t> buf(static_cast<size_t>(read_samples));
+    const int max_samples = rate * channels * kMaxSeconds;
     while (running_) {
-      if (pa_simple_read(s, buf, sizeof(buf), &error) < 0) break;
+      int read_err = 0;
+      if (pa_simple_read(s, buf.data(), buf.size() * sizeof(int16_t),
+                         &read_err) < 0) {
+        break;
+      }
       double sum = 0;
-      for (int i = 0; i < kFrameSamples; ++i) {
-        const double v = buf[i] / 32768.0;
+      const int frames = read_samples / channels;
+      for (int i = 0; i < frames; ++i) {
+        int acc = 0;
+        for (int c = 0; c < channels; ++c) {
+          acc += buf[static_cast<size_t>(i * channels + c)];
+        }
+        const double v = (acc / channels) / 32768.0;
         sum += v * v;
       }
-      const double rms = std::sqrt(sum / kFrameSamples);
+      const double rms = std::sqrt(sum / std::max(1, frames));
       amplitude_ = rms > 1e-9 ? 20.0 * std::log10(rms) : -60.0;
       if (paused_) continue;
       std::lock_guard<std::mutex> lock(mu_);
-      pcm_.insert(pcm_.end(), buf, buf + kFrameSamples);
+      pcm_.insert(pcm_.end(), buf.begin(), buf.end());
       if (static_cast<int>(pcm_.size()) > max_samples) {
         running_ = false;
         break;
@@ -450,16 +653,30 @@ bool UtMediaPlugin::StartRecording(const std::string& path, std::string* error) 
     }
     pa_simple_free(s);
   });
+
+  std::unique_lock<std::mutex> lock(mu_);
+  start_cv_.wait_for(lock, std::chrono::seconds(3), [this] { return start_done_; });
+  if (!start_ok_) {
+    *error = start_error_.empty() ? "Could not start microphone." : start_error_;
+    lock.unlock();
+    if (thread_.joinable()) thread_.join();
+    running_ = false;
+    return false;
+  }
   return true;
 }
 
 bool UtMediaPlugin::StopRecording(std::string* path_out, std::string* error) {
   std::vector<int16_t> copy;
   std::string path;
+  int rate = kEncoderRate;
+  int channels = 1;
   {
     std::lock_guard<std::mutex> lock(mu_);
     running_ = false;
     path = path_;
+    rate = capture_rate_;
+    channels = capture_channels_;
   }
   if (thread_.joinable()) thread_.join();
   {
@@ -467,8 +684,18 @@ bool UtMediaPlugin::StopRecording(std::string* path_out, std::string* error) {
     copy.swap(pcm_);
     path_.clear();
   }
-  if (!EncodeOpusFile(copy, path)) {
-    *error = "Could not encode voice message";
+  auto mono = ToMono16(copy, std::max(1, channels));
+  mono = ResampleTo16k(mono, rate);
+  if (path.empty()) {
+    path = WritableDir() + "/voice_message.ogg";
+  }
+  if (!EncodeOpusFile(mono, path)) {
+    const std::string fallback = WritableDir() + "/voice_message.ogg";
+    if (fallback != path && EncodeOpusFile(mono, fallback)) {
+      *path_out = fallback;
+      return true;
+    }
+    *error = "Could not encode voice message.";
     return false;
   }
   *path_out = path;
@@ -477,10 +704,13 @@ bool UtMediaPlugin::StopRecording(std::string* path_out, std::string* error) {
 
 void UtMediaPlugin::Cancel() {
   running_ = false;
+  start_cv_.notify_all();
   if (thread_.joinable()) thread_.join();
   std::lock_guard<std::mutex> lock(mu_);
   pcm_.clear();
   path_.clear();
+  start_done_ = false;
+  start_ok_ = false;
 }
 
 void UtMediaPlugin::HandleMethodCall(

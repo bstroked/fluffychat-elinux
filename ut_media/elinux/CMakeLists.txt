@@ -5,7 +5,7 @@ project(${PROJECT_NAME} LANGUAGES CXX)
 set(PLUGIN_NAME "ut_media_plugin")
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(PULSE REQUIRED libpulse-simple)
+pkg_check_modules(PULSE REQUIRED libpulse libpulse-simple)
 pkg_check_modules(OPUS REQUIRED opus)
 pkg_check_modules(GLIB REQUIRED glib-2.0 gio-2.0)
 pkg_check_modules(VORBISFILE vorbisfile)
