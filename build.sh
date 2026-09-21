@@ -109,10 +109,11 @@ patch -p1 --forward --reject-file=/dev/null \
     < "${ROOT}/patches/fluffychat-timeline-error-context.patch" 2>/dev/null || true
 
 # Raise notifications through the postal service. AppArmor blocks a confined
-# app from reaching org.freedesktop.Notifications, so the flutter_local_
-# notifications path can only ever fail here.
+# app from reaching org.freedesktop.Notifications, so flutter_local_
+# notifications only ever throws AccessDenied here. Also plays Xylo+haptic
+# while the app is open, enables PulseAudio voice notes, and swipe-up-to-go-back.
 patch -p1 --forward --reject-file=/dev/null \
-    < "${ROOT}/patches/fluffychat-postal-notifications.patch" 2>/dev/null || true
+    < "${ROOT}/patches/fluffychat-ut-mod.patch" 2>/dev/null || true
 
 # Open the room behind a URL dispatched to the app, which is what a tapped
 # notification turns into.
@@ -167,6 +168,11 @@ fi
 # then hands to the homeserver as the Matrix pushkey.
 if ! grep -q 'lomiri_push_client' pubspec.yaml; then
     flutter pub add lomiri_push_client --path="${ROOT}/lomiri_push_client"
+fi
+
+# PulseAudio/Opus voice notes, Xylo chime, and haptic for Ubuntu Touch.
+if ! grep -q 'ut_media' pubspec.yaml; then
+    flutter pub add ut_media --path="${ROOT}/ut_media"
 fi
 
 # Get dependencies

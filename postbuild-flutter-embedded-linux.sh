@@ -32,6 +32,9 @@ fi
 GEN_SNAPSHOT_SUBDIR="linux-${HOST_FLUTTER_ARCH}"
 
 GEN_SNAPSHOT="${ENGINE_DIR}/gen_snapshot"
+if [ -x "${ENGINE_DIR}/gen_snapshot.wrapper" ] && [ -f "${ENGINE_DIR}/gen_snapshot.aarch64" ]; then
+    GEN_SNAPSHOT="${ENGINE_DIR}/gen_snapshot.wrapper"
+fi
 if [ ! -f "${GEN_SNAPSHOT}" ]; then
     echo "ERROR: gen_snapshot not found at ${GEN_SNAPSHOT}"
     exit 1
@@ -65,6 +68,12 @@ make_arch_zip() {
     cp "${EMBEDDER_LIB}"  "${TMP}/libflutter_elinux_wayland.so"
     cp "${ENGINE_LIB}"    "${TMP}/libflutter_engine.so"
     cp "${GEN_SNAPSHOT}"  "${TMP}/${GEN_SNAPSHOT_SUBDIR}/gen_snapshot"
+    chmod +x "${TMP}/${GEN_SNAPSHOT_SUBDIR}/gen_snapshot"
+    if [ -f "${ENGINE_DIR}/gen_snapshot.aarch64" ]; then
+        cp "${ENGINE_DIR}/gen_snapshot.aarch64" \
+           "${TMP}/${GEN_SNAPSHOT_SUBDIR}/gen_snapshot.aarch64"
+        chmod +x "${TMP}/${GEN_SNAPSHOT_SUBDIR}/gen_snapshot.aarch64"
+    fi
     (cd "${TMP}" && zip -r "${ZIP}" .)
     rm -rf "${TMP}"
     echo "  Created: ${ZIP}"

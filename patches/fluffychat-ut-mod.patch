@@ -1,0 +1,368 @@
+diff --git a/lib/pages/chat/chat_input_row.dart b/lib/pages/chat/chat_input_row.dart
+index 879717fa9..1ed623748 100644
+--- a/lib/pages/chat/chat_input_row.dart
++++ b/lib/pages/chat/chat_input_row.dart
+@@ -341,7 +341,7 @@ class ChatInputRow extends StatelessWidget {
+                         ? HoverBuilder(
+                             builder: (context, hovered) => IconButton(
+                               tooltip: L10n.of(context).voiceMessage,
+-                              onPressed: hovered
++                              onPressed: hovered || PlatformInfos.isLinux
+                                   ? () => recordingViewModel.startRecording(
+                                       controller.room,
+                                     )
+diff --git a/lib/pages/chat/recording_view_model.dart b/lib/pages/chat/recording_view_model.dart
+index 7d9d886d4..851e7a25d 100644
+--- a/lib/pages/chat/recording_view_model.dart
++++ b/lib/pages/chat/recording_view_model.dart
+@@ -17,6 +17,7 @@ import 'package:matrix/matrix.dart';
+ import 'package:path/path.dart' as path_lib;
+ import 'package:path_provider/path_provider.dart';
+ import 'package:record/record.dart';
++import 'package:ut_media/ut_media.dart';
+ import 'package:wakelock_plus/wakelock_plus.dart';
+ 
+ import 'events/audio_player.dart';
+@@ -34,9 +35,11 @@ class RecordingViewModelState extends State<RecordingViewModel> {
+   Timer? _recorderSubscription;
+   Duration duration = Duration.zero;
+ 
+-  bool get isRecording => _audioRecorder != null;
++  bool get isRecording => _audioRecorder != null || _utRecording;
+ 
+   AudioRecorder? _audioRecorder;
++  bool _utRecording = false;
++  String? _utPath;
+   final List<double> amplitudeTimeline = [];
+ 
+   String? fileName;
+@@ -58,6 +61,10 @@ class RecordingViewModelState extends State<RecordingViewModel> {
+         return;
+       }
+     }
++    if (PlatformInfos.isLinux) {
++      await _startUtRecording();
++      return;
++    }
+     if (await AudioRecorder().hasPermission() == false) return;
+ 
+     final audioRecorder = _audioRecorder ??= AudioRecorder();
+@@ -117,6 +124,30 @@ class RecordingViewModelState extends State<RecordingViewModel> {
+     }
+   }
+ 
++  Future<void> _startUtRecording() async {
++    try {
++      fileName =
++          'voice_message_${DateTime.now().millisecondsSinceEpoch}.ogg';
++      final tempDir = await getTemporaryDirectory();
++      _utPath = path_lib.join(tempDir.path, fileName);
++      await WakelockPlus.enable();
++      await UtMedia.startRecording(_utPath!);
++      _utRecording = true;
++      if (!mounted) return;
++      setState(() => duration = Duration.zero);
++      _subscribe();
++    } catch (e, s) {
++      Logs().w('Unable to start Ubuntu Touch voice recording', e, s);
++      if (!mounted) return;
++      showOkAlertDialog(
++        context: context,
++        title: L10n.of(context).oopsSomethingWentWrong,
++        message: e.toString(),
++      );
++      setState(_reset);
++    }
++  }
++
+   @override
+   void dispose() {
+     _reset();
+@@ -128,8 +159,10 @@ class RecordingViewModelState extends State<RecordingViewModel> {
+     _recorderSubscription = Timer.periodic(const Duration(milliseconds: 100), (
+       _,
+     ) async {
+-      final amplitude = await _audioRecorder!.getAmplitude();
+-      var value = 100 + amplitude.current * 2;
++      final current = _utRecording
++          ? await UtMedia.amplitude()
++          : (await _audioRecorder!.getAmplitude()).current;
++      var value = 100 + current * 2;
+       value = value < 1 ? 1 : value;
+       amplitudeTimeline.add(value);
+       setState(() {
+@@ -141,8 +174,13 @@ class RecordingViewModelState extends State<RecordingViewModel> {
+   void _reset() {
+     WakelockPlus.disable();
+     _recorderSubscription?.cancel();
++    if (_utRecording) {
++      UtMedia.cancelRecording();
++    }
+     _audioRecorder?.stop();
+     _audioRecorder = null;
++    _utRecording = false;
++    _utPath = null;
+ 
+     fileName = null;
+     duration = Duration.zero;
+@@ -155,7 +193,11 @@ class RecordingViewModelState extends State<RecordingViewModel> {
+   }
+ 
+   void pause() {
+-    _audioRecorder?.pause();
++    if (_utRecording) {
++      UtMedia.pauseRecording();
++    } else {
++      _audioRecorder?.pause();
++    }
+     _recorderSubscription?.cancel();
+     setState(() {
+       isPaused = true;
+@@ -163,7 +205,11 @@ class RecordingViewModelState extends State<RecordingViewModel> {
+   }
+ 
+   void resume() {
+-    _audioRecorder?.resume();
++    if (_utRecording) {
++      UtMedia.resumeRecording();
++    } else {
++      _audioRecorder?.resume();
++    }
+     _subscribe();
+     setState(() {
+       isPaused = false;
+@@ -180,7 +226,10 @@ class RecordingViewModelState extends State<RecordingViewModel> {
+     onSend,
+   ) async {
+     _recorderSubscription?.cancel();
+-    final path = await _audioRecorder?.stop();
++    final path = _utRecording
++        ? await UtMedia.stopRecording()
++        : await _audioRecorder?.stop();
++    _utRecording = false;
+ 
+     if (path == null) throw ('Recording failed!');
+     const waveCount = AudioPlayerWidget.wavesCount;
+diff --git a/lib/utils/platform_infos.dart b/lib/utils/platform_infos.dart
+index f331edc16..cf6bd5f2a 100644
+--- a/lib/utils/platform_infos.dart
++++ b/lib/utils/platform_infos.dart
+@@ -40,8 +40,10 @@ abstract class PlatformInfos {
+   static bool get supportsCustomImageResizer =>
+       PlatformInfos.isWeb || PlatformInfos.isMobile;
+ 
+-  /// Web could also record in theory but currently creates broken opus
+-  static bool get platformCanRecord => (isMobile || isMacOS);
++  /// Web could also record in theory but currently creates broken opus.
++  /// Linux is included for the Ubuntu Touch eLinux build, which records
++  /// through PulseAudio rather than the GStreamer record_linux plugin.
++  static bool get platformCanRecord => (isMobile || isMacOS || isLinux);
+ 
+   static bool get supportsAppLock => (isMobile || isMacOS);
+ 
+diff --git a/lib/widgets/bottom_back_gesture.dart b/lib/widgets/bottom_back_gesture.dart
+new file mode 100644
+index 000000000..3ad2f38e2
+--- /dev/null
++++ b/lib/widgets/bottom_back_gesture.dart
+@@ -0,0 +1,83 @@
++import 'package:fluffychat/utils/platform_infos.dart';
++import 'package:flutter/material.dart';
++import 'package:go_router/go_router.dart';
++import 'package:ut_media/ut_media.dart';
++
++/// Cinny-style swipe-up-from-bottom to go back, for Ubuntu Touch.
++class BottomBackGesture extends StatefulWidget {
++  const BottomBackGesture({super.key});
++
++  @override
++  State<BottomBackGesture> createState() => _BottomBackGestureState();
++}
++
++class _BottomBackGestureState extends State<BottomBackGesture> {
++  double _drag = 0;
++  static const _trigger = 48.0;
++
++  void _goBack(BuildContext context) {
++    final router = GoRouter.of(context);
++    if (router.canPop()) {
++      router.pop();
++      return;
++    }
++    final path = router.routerDelegate.currentConfiguration.uri.path;
++    if (path == '/' || path == '/rooms' || path == '/home') return;
++    if (path.startsWith('/rooms/')) {
++      final parts = path.split('/');
++      if (parts.length > 3) {
++        router.go(parts.sublist(0, parts.length - 1).join('/'));
++      } else {
++        router.go('/rooms');
++      }
++      return;
++    }
++    if (path.startsWith('/home/')) {
++      router.go('/home');
++      return;
++    }
++    router.go('/rooms');
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    if (!PlatformInfos.isLinux) return const SizedBox.shrink();
++    final theme = Theme.of(context);
++    return Positioned(
++      left: 0,
++      right: 0,
++      bottom: 0,
++      height: 28,
++      child: GestureDetector(
++        behavior: HitTestBehavior.translucent,
++        onVerticalDragStart: (_) {
++          UtMedia.haptic();
++          setState(() => _drag = 0);
++        },
++        onVerticalDragUpdate: (details) {
++          setState(() => _drag -= details.delta.dy);
++        },
++        onVerticalDragEnd: (_) {
++          if (_drag > _trigger) _goBack(context);
++          setState(() => _drag = 0);
++        },
++        child: Align(
++          alignment: Alignment.bottomCenter,
++          child: AnimatedOpacity(
++            duration: const Duration(milliseconds: 120),
++            opacity: _drag > 8 ? 1 : 0.55,
++            child: Container(
++              margin: const EdgeInsets.only(bottom: 8),
++              width: 96,
++              height: 4,
++              decoration: BoxDecoration(
++                color: theme.colorScheme.onSurface.withAlpha(90),
++                borderRadius: BorderRadius.circular(2),
++              ),
++            ),
++          ),
++        ),
++      ),
++    );
++  }
++}
+diff --git a/lib/widgets/fluffy_chat_app.dart b/lib/widgets/fluffy_chat_app.dart
+index 2e2d7b029..0b9e705f9 100644
+--- a/lib/widgets/fluffy_chat_app.dart
++++ b/lib/widgets/fluffy_chat_app.dart
+@@ -9,6 +9,7 @@ import 'package:fluffychat/config/setting_keys.dart';
+ import 'package:fluffychat/config/themes.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/widgets/app_lock.dart';
++import 'package:fluffychat/widgets/bottom_back_gesture.dart';
+ import 'package:fluffychat/widgets/theme_builder.dart';
+ import 'package:flutter/material.dart';
+ import 'package:go_router/go_router.dart';
+@@ -82,10 +83,16 @@ class FluffyChatApp extends StatelessWidget {
+           isLoggedIn: clients.any((client) => client.isLogged()),
+           // Need a navigator above the Matrix widget for
+           // displaying dialogs
+-          child: Matrix(
+-            clients: clients,
+-            store: store,
+-            child: testWidget ?? child,
++          child: Stack(
++            fit: StackFit.expand,
++            children: [
++              Matrix(
++                clients: clients,
++                store: store,
++                child: testWidget ?? child,
++              ),
++              const BottomBackGesture(),
++            ],
+           ),
+         ),
+       ),
+diff --git a/lib/widgets/local_notifications_extension.dart b/lib/widgets/local_notifications_extension.dart
+index 840a7d4b9..17ea8fd29 100644
+--- a/lib/widgets/local_notifications_extension.dart
++++ b/lib/widgets/local_notifications_extension.dart
+@@ -13,8 +13,10 @@ import 'package:fluffychat/widgets/matrix.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
++import 'package:lomiri_push_client/lomiri_push_client.dart';
+ import 'package:matrix/matrix.dart';
+ import 'package:universal_html/html.dart' as html;
++import 'package:ut_media/ut_media.dart';
+ 
+ extension LocalNotificationsExtension on MatrixState {
+   static final html.AudioElement _audioPlayer = html.AudioElement()
+@@ -22,12 +24,21 @@ extension LocalNotificationsExtension on MatrixState {
+     ..load();
+ 
+   Future<void> showLocalNotification(Event event) async {
+-    final l10n = L10n.of(context);
+     final roomId = event.room.id;
++    if (event.senderId == client.userID) return;
++    final inForeground =
++        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
++    if (inForeground) {
++      // Lomiri suppresses Postal banners for the focused app, so play Xylo
++      // plus haptic here — including when the open room is the one that
++      // just received the message.
++      await UtMedia.playAlert();
++      await UtMedia.haptic();
++      if (activeRoomId == roomId) return;
++      return;
++    }
+     if (activeRoomId == roomId) {
+-      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+-        return;
+-      }
++      return;
+     }
+ 
+     final title = event.room.getLocalizedDisplayname(
+@@ -83,30 +94,19 @@ extension LocalNotificationsExtension on MatrixState {
+       return;
+     }
+ 
+-    FlutterLocalNotificationsPlugin().show(
+-      id: event.room.id.hashCode,
+-      title: title,
++    // A confined Ubuntu Touch app is not allowed to talk to
++    // org.freedesktop.Notifications, so flutter_local_notifications only ever
++    // throws AccessDenied here. Postal is the sanctioned route, and it gives
++    // the same notification the push helper raises: tapping it dispatches the
++    // URL back to us and opens the room.
++    await LomiriPushClient.post(
++      summary: title,
+       body: body,
+-      notificationDetails: NotificationDetails(
+-        linux: LinuxNotificationDetails(
+-          sound: ThemeLinuxSound('message-new-instant'),
+-          actions: [
+-            LinuxNotificationAction(
+-              key: FluffyChatNotificationActions.markAsRead.name,
+-              label: l10n.markAsRead,
+-            ),
+-            LinuxNotificationAction(
+-              key: FluffyChatNotificationActions.mute.name,
+-              label: l10n.mute,
+-            ),
+-          ],
+-        ),
+-      ),
+-      payload: FluffyChatPushPayload(
+-        client.clientName,
+-        event.room.id,
+-        event.eventId,
+-      ).toString(),
++      tag: event.room.id,
++      icon: event.room.isDirectChat ? 'contact' : 'contact-group',
++      actions: ['fluffychat://${event.room.id}'],
++      sound: true,
++      vibrate: true,
+     );
+   }
+ }

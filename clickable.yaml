@@ -16,6 +16,7 @@ dependencies_host:
 - zip
 - unzip
 - patchelf
+- qemu-user-static
 
 dependencies_target:
 - libegl1-mesa-dev
@@ -33,10 +34,18 @@ dependencies_target:
 - libmaliit-glib-dev
 - libssl-dev
 - libcontent-hub-glib-dev
+- libopus-dev
+- libpulse-dev
+- libvorbis-dev
+- libogg-dev
 
 install_lib:
 - /usr/lib/libmaliit-glib.so.*
 - /usr/lib/*/libcontent-hub-glib.so.*
+- /usr/lib/*/libopus.so.*
+- /usr/lib/*/libvorbis.so.*
+- /usr/lib/*/libvorbisfile.so.*
+- /usr/lib/*/libogg.so.*
 
 build:
 - ${ROOT}/build.sh
@@ -61,6 +70,7 @@ libraries:
     - clang
     - zip
     - unzip
+    - qemu-user-static
     dependencies_target:
     - libegl1-mesa-dev
     - libgles2-mesa-dev
