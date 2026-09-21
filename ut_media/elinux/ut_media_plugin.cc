@@ -180,7 +180,7 @@ std::vector<uint8_t> WriteOggPage(uint32_t serial, uint32_t seq, uint64_t granul
   return page;
 }
 
-std::vector<uint8_t> OpusHead() {
+std::vector<uint8_t> MakeOpusHeadPacket() {
   std::vector<uint8_t> h;
   h.insert(h.end(), {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd'});
   h.push_back(1);
@@ -193,7 +193,7 @@ std::vector<uint8_t> OpusHead() {
   return h;
 }
 
-std::vector<uint8_t> OpusTags() {
+std::vector<uint8_t> MakeOpusTagsPacket() {
   const char* vendor = "CinnyUT";
   const char* comment = "ENCODER=cinny-pulse-opus";
   std::vector<uint8_t> t;
@@ -220,9 +220,9 @@ std::vector<uint8_t> BuildOgg(const std::vector<std::vector<uint8_t>>& frames) {
     mux_frames.push_back(static_cast<int>(n));
   }
   std::vector<uint8_t> out;
-  auto head = WriteOggPage(serial, 0, 0, 2, {OpusHead()});
+  auto head = WriteOggPage(serial, 0, 0, 2, {MakeOpusHeadPacket()});
   out.insert(out.end(), head.begin(), head.end());
-  auto tags = WriteOggPage(serial, 1, 0, 0, {OpusTags()});
+  auto tags = WriteOggPage(serial, 1, 0, 0, {MakeOpusTagsPacket()});
   out.insert(out.end(), tags.begin(), tags.end());
   uint32_t seq = 2;
   int frames_done = 0;
@@ -460,7 +460,7 @@ bool PlayOpusFile(const std::string& path) {
   int err = 0;
   OggOpusFile* of = op_open_file(path.c_str(), &err);
   if (!of) return false;
-  const OpusHead* head = op_head(of, nullptr);
+  const struct OpusHead* head = op_head(of, -1);
   const int channels = head ? head->channel_count : 1;
   pa_sample_spec ss;
   ss.format = PA_SAMPLE_S16LE;
