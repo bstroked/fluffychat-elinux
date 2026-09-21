@@ -44,7 +44,8 @@ install_lib:
 - /usr/lib/libmaliit-glib.so.*
 - /usr/lib/*/libcontent-hub-glib.so.*
 - /usr/lib/*/libopus.so.*
-- /usr/lib/*/libopusfile.so.*
+- /usr/lib/libopusfile.so.*
+- /usr/lib/libopusurl.so.*
 - /usr/lib/*/libvorbis.so.*
 - /usr/lib/*/libvorbisfile.so.*
 - /usr/lib/*/libogg.so.*
