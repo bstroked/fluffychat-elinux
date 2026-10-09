@@ -6,6 +6,7 @@
 #include <gio/gio.h>
 #include <opus/opus.h>
 #include <pulse/error.h>
+#include <pulse/proplist.h>
 #include <pulse/pulseaudio.h>
 #include <pulse/simple.h>
 
@@ -15,6 +16,9 @@
 #ifdef UT_MEDIA_HAVE_OPUSFILE
 #include <opusfile.h>
 #endif
+#ifdef UT_MEDIA_HAVE_GST
+#include <gst/gst.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -22,11 +26,13 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -422,6 +428,139 @@ pa_simple* OpenAt(uint32_t rate, uint8_t channels, int* error_out) {
   return s;
 }
 
+// Ubuntu Touch's notifier (lomiri-push-service) plays Xylo with paplay
+// under PULSE_PROP='media.role=alert'. That is the role touch.pa ducks
+// multimedia against, and the one the Alert slider follows. "event" is
+// only positioned UI clicks and rides the Media slider. Do not set
+// application.name to "fluffychat" or stream-restore copies voice/media
+// volume onto the chime.
+bool PlayPcmWithRole(const pa_sample_spec* ss, const void* data, size_t nbytes,
+                     const char* role) {
+  if (!ss || !data || nbytes == 0 || !role || !role[0]) return false;
+
+  pa_proplist* pl = pa_proplist_new();
+  if (!pl) return false;
+  pa_proplist_sets(pl, PA_PROP_MEDIA_ROLE, role);
+  pa_proplist_sets(pl, PA_PROP_MEDIA_NAME, "Notification");
+  pa_proplist_sets(pl, PA_PROP_APPLICATION_NAME, "fluffychat-alert");
+
+  pa_mainloop* ml = pa_mainloop_new();
+  if (!ml) {
+    pa_proplist_free(pl);
+    return false;
+  }
+  pa_context* ctx = pa_context_new_with_proplist(
+      pa_mainloop_get_api(ml), "fluffychat-alert", pl);
+  pa_proplist_free(pl);
+  if (!ctx) {
+    pa_mainloop_free(ml);
+    return false;
+  }
+  if (pa_context_connect(ctx, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
+    return false;
+  }
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  auto pump_until = [&](auto done) {
+    while (!done() && std::chrono::steady_clock::now() < deadline) {
+      if (pa_mainloop_iterate(ml, 1, nullptr) < 0) return false;
+    }
+    return done();
+  };
+
+  if (!pump_until([&] {
+        const pa_context_state_t st = pa_context_get_state(ctx);
+        return st == PA_CONTEXT_READY || st == PA_CONTEXT_FAILED ||
+               st == PA_CONTEXT_TERMINATED;
+      }) ||
+      pa_context_get_state(ctx) != PA_CONTEXT_READY) {
+    pa_context_disconnect(ctx);
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
+    return false;
+  }
+
+  pa_proplist* spl = pa_proplist_new();
+  pa_proplist_sets(spl, PA_PROP_MEDIA_ROLE, role);
+  pa_proplist_sets(spl, PA_PROP_MEDIA_NAME, "Notification");
+  pa_proplist_sets(spl, "module-stream-restore.id",
+                   "sink-input-by-media-role:alert");
+  pa_stream* stream =
+      pa_stream_new_with_proplist(ctx, "alert", ss, nullptr, spl);
+  pa_proplist_free(spl);
+  if (!stream) {
+    pa_context_disconnect(ctx);
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
+    return false;
+  }
+
+  const pa_stream_flags_t flags = static_cast<pa_stream_flags_t>(
+      PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_AUTO_TIMING_UPDATE |
+      PA_STREAM_ADJUST_LATENCY);
+  if (pa_stream_connect_playback(stream, nullptr, nullptr, flags, nullptr,
+                                 nullptr) < 0) {
+    pa_stream_unref(stream);
+    pa_context_disconnect(ctx);
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
+    return false;
+  }
+
+  if (!pump_until([&] {
+        const pa_stream_state_t st = pa_stream_get_state(stream);
+        return st == PA_STREAM_READY || st == PA_STREAM_FAILED ||
+               st == PA_STREAM_TERMINATED;
+      }) ||
+      pa_stream_get_state(stream) != PA_STREAM_READY) {
+    pa_stream_disconnect(stream);
+    pa_stream_unref(stream);
+    pa_context_disconnect(ctx);
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
+    return false;
+  }
+
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  size_t left = nbytes;
+  while (left > 0 && std::chrono::steady_clock::now() < deadline) {
+    size_t n = pa_stream_writable_size(stream);
+    if (n == static_cast<size_t>(-1)) break;
+    if (n == 0) {
+      if (pa_mainloop_iterate(ml, 1, nullptr) < 0) break;
+      continue;
+    }
+    if (n > left) n = left;
+    if (pa_stream_write(stream, p, n, nullptr, 0, PA_SEEK_RELATIVE) < 0) break;
+    p += n;
+    left -= n;
+  }
+
+  bool drained = false;
+  pa_operation* op = pa_stream_drain(
+      stream,
+      [](pa_stream*, int, void* ud) { *static_cast<bool*>(ud) = true; },
+      &drained);
+  if (op) {
+    const auto drain_until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (!drained && std::chrono::steady_clock::now() < drain_until) {
+      if (pa_mainloop_iterate(ml, 1, nullptr) < 0) break;
+    }
+    pa_operation_unref(op);
+  }
+
+  pa_stream_disconnect(stream);
+  pa_stream_unref(stream);
+  pa_context_disconnect(ctx);
+  pa_context_unref(ctx);
+  pa_mainloop_free(ml);
+  return left == 0;
+}
+
 pa_simple* OpenCapture(int* rate_out, int* channels_out, int* error_out) {
   // Cinny’s working path is Qt’s default input at the phone’s own PCM
   // format (nearestFormat), not a forced 48 kHz Opus encode.
@@ -454,6 +593,37 @@ pa_simple* OpenCapture(int* rate_out, int* channels_out, int* error_out) {
 void PlayBeep();  // defined below
 
 std::atomic<bool> g_playing{false};
+std::atomic<bool> g_paused{false};
+std::mutex g_play_mu;
+std::condition_variable g_play_cv;
+std::atomic<int> g_play_start{0};  // 0 idle, 1 ok, -1 fail
+std::atomic<int64_t> g_position_ms{0};
+std::atomic<int64_t> g_duration_ms{0};
+std::atomic<int64_t> g_seek_to_ms{-1};
+
+void SignalPlayStart(bool ok) {
+  int expected = 0;
+  if (!g_play_start.compare_exchange_strong(expected, ok ? 1 : -1)) return;
+  g_play_cv.notify_all();
+}
+
+void ResetPlaybackClock() {
+  g_position_ms.store(0);
+  g_duration_ms.store(0);
+  g_seek_to_ms.store(-1);
+}
+
+void MarkPlaybackEnded() {
+  const int64_t dur = g_duration_ms.load();
+  const int64_t pos = g_position_ms.load();
+  if (dur > 0) {
+    g_position_ms.store(dur);
+  } else if (pos > 0) {
+    g_duration_ms.store(pos);
+  }
+}
+
+int64_t ConsumeSeekMs() { return g_seek_to_ms.exchange(-1); }
 
 bool PlayOpusFile(const std::string& path) {
 #ifdef UT_MEDIA_HAVE_OPUSFILE
@@ -473,15 +643,34 @@ bool PlayOpusFile(const std::string& path) {
     op_free(of);
     return false;
   }
+  SignalPlayStart(true);
+  const ogg_int64_t total_pcm = op_pcm_total(of, -1);
+  if (total_pcm > 0) g_duration_ms.store(total_pcm / 48);
   int16_t buf[960 * 8];
+  bool natural_end = false;
   while (g_playing.load()) {
+    const int64_t seek = ConsumeSeekMs();
+    if (seek >= 0) {
+      op_pcm_seek(of, seek * 48);
+      g_position_ms.store(seek);
+    }
+    if (g_paused.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
     const int n = op_read(of, buf, 960 * ss.channels, nullptr);
-    if (n <= 0) break;
+    if (n <= 0) {
+      natural_end = true;
+      break;
+    }
+    const ogg_int64_t tell = op_pcm_tell(of);
+    if (tell >= 0) g_position_ms.store(tell / 48);
     if (pa_simple_write(s, buf, static_cast<size_t>(n) * ss.channels * sizeof(int16_t),
                         &error) < 0) {
       break;
     }
   }
+  if (natural_end) MarkPlaybackEnded();
   if (g_playing.load()) pa_simple_drain(s, &error);
   pa_simple_free(s);
   op_free(of);
@@ -512,13 +701,37 @@ bool PlayVorbisFile(const std::string& path) {
     ov_clear(&vf);
     return false;
   }
+  SignalPlayStart(true);
+  const double total_s = ov_time_total(&vf, -1);
+  if (total_s > 0) {
+    g_duration_ms.store(static_cast<int64_t>(total_s * 1000.0));
+  }
   char pcm[4096];
   int bitstream = 0;
   long n = 0;
-  while (g_playing.load() &&
-         (n = ov_read(&vf, pcm, sizeof(pcm), 0, 2, 1, &bitstream)) > 0) {
+  bool natural_end = false;
+  while (g_playing.load()) {
+    const int64_t seek = ConsumeSeekMs();
+    if (seek >= 0) {
+      ov_time_seek(&vf, static_cast<double>(seek) / 1000.0);
+      g_position_ms.store(seek);
+    }
+    if (g_paused.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
+    n = ov_read(&vf, pcm, sizeof(pcm), 0, 2, 1, &bitstream);
+    if (n <= 0) {
+      natural_end = true;
+      break;
+    }
+    const double tell = ov_time_tell(&vf);
+    if (tell >= 0) {
+      g_position_ms.store(static_cast<int64_t>(tell * 1000.0));
+    }
     pa_simple_write(s, pcm, static_cast<size_t>(n), &error);
   }
+  if (natural_end) MarkPlaybackEnded();
   if (g_playing.load()) pa_simple_drain(s, &error);
   pa_simple_free(s);
   ov_clear(&vf);
@@ -529,25 +742,177 @@ bool PlayVorbisFile(const std::string& path) {
 #endif
 }
 
-void PlayAudioFile(const std::string& path) {
-  g_playing = true;
-  if (!PlayOpusFile(path)) {
-    PlayVorbisFile(path);
+#ifdef UT_MEDIA_HAVE_GST
+void InitGst() {
+  static std::once_flag once;
+  std::call_once(once, []() {
+    const std::string reg = WritableDir() + "/gstreamer-registry.bin";
+    setenv("GST_REGISTRY_1_0", reg.c_str(), 0);
+    gst_init(nullptr, nullptr);
+  });
+}
+
+bool PlayGstFile(const std::string& path) {
+  InitGst();
+  GError* err = nullptr;
+  gchar* uri = gst_filename_to_uri(path.c_str(), &err);
+  if (!uri) {
+    if (err) {
+      std::fprintf(stderr, "ut_media gst uri: %s\n", err->message);
+      g_error_free(err);
+    }
+    return false;
   }
+  GstElement* pipeline = gst_element_factory_make("playbin", "player");
+  if (!pipeline) {
+    g_free(uri);
+    std::fprintf(stderr, "ut_media: playbin missing\n");
+    return false;
+  }
+  g_object_set(pipeline, "uri", uri, nullptr);
+  g_free(uri);
+  gint flags = 0;
+  g_object_get(pipeline, "flags", &flags, nullptr);
+  flags |= (1 << 1);   // GST_PLAY_FLAG_AUDIO
+  flags &= ~(1 << 0);  // GST_PLAY_FLAG_VIDEO
+  g_object_set(pipeline, "flags", flags, nullptr);
+  GstElement* asink = gst_element_factory_make("pulsesink", "asink");
+  if (asink) g_object_set(pipeline, "audio-sink", asink, nullptr);
+  GstElement* vsink = gst_element_factory_make("fakesink", "vsink");
+  if (vsink) g_object_set(pipeline, "video-sink", vsink, nullptr);
+
+  if (gst_element_set_state(pipeline, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE) {
+    gst_object_unref(pipeline);
+    return false;
+  }
+  GstState state = GST_STATE_NULL;
+  const GstStateChangeReturn got =
+      gst_element_get_state(pipeline, &state, nullptr, 5 * GST_SECOND);
+  if (got == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
+    GstBus* err_bus = gst_element_get_bus(pipeline);
+    GstMessage* err_msg = gst_bus_pop_filtered(err_bus, GST_MESSAGE_ERROR);
+    if (err_msg) {
+      GError* gerr = nullptr;
+      gchar* dbg = nullptr;
+      gst_message_parse_error(err_msg, &gerr, &dbg);
+      std::fprintf(stderr, "ut_media gst: %s (%s)\n",
+                   gerr ? gerr->message : "error", dbg ? dbg : "");
+      if (gerr) g_error_free(gerr);
+      g_free(dbg);
+      gst_message_unref(err_msg);
+    }
+    gst_object_unref(err_bus);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    return false;
+  }
+  SignalPlayStart(true);
+
+  auto query_gst_times = [&]() {
+    gint64 pos = 0;
+    gint64 dur = 0;
+    if (gst_element_query_position(pipeline, GST_FORMAT_TIME, &pos) &&
+        pos >= 0) {
+      g_position_ms.store(pos / GST_MSECOND);
+    }
+    if (gst_element_query_duration(pipeline, GST_FORMAT_TIME, &dur) &&
+        dur > 0) {
+      g_duration_ms.store(dur / GST_MSECOND);
+    }
+  };
+  auto apply_gst_seek = [&]() {
+    const int64_t seek = ConsumeSeekMs();
+    if (seek < 0) return;
+    gst_element_seek_simple(
+        pipeline, GST_FORMAT_TIME,
+        static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
+        static_cast<gint64>(seek) * GST_MSECOND);
+    g_position_ms.store(seek);
+  };
+  query_gst_times();
+
+  GstBus* bus = gst_element_get_bus(pipeline);
+  bool paused_pipe = false;
+  bool natural_end = false;
+  while (g_playing.load()) {
+    apply_gst_seek();
+    query_gst_times();
+    if (g_paused.load()) {
+      if (!paused_pipe) {
+        gst_element_set_state(pipeline, GST_STATE_PAUSED);
+        paused_pipe = true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
+    if (paused_pipe) {
+      gst_element_set_state(pipeline, GST_STATE_PLAYING);
+      paused_pipe = false;
+    }
+    GstMessage* msg = gst_bus_timed_pop_filtered(
+        bus, 80 * GST_MSECOND,
+        static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+    if (!msg) continue;
+    const GstMessageType type = GST_MESSAGE_TYPE(msg);
+    if (type == GST_MESSAGE_ERROR) {
+      GError* gerr = nullptr;
+      gchar* dbg = nullptr;
+      gst_message_parse_error(msg, &gerr, &dbg);
+      std::fprintf(stderr, "ut_media gst play: %s (%s)\n",
+                   gerr ? gerr->message : "error", dbg ? dbg : "");
+      if (gerr) g_error_free(gerr);
+      g_free(dbg);
+      gst_message_unref(msg);
+      break;
+    }
+    gst_message_unref(msg);
+    if (type == GST_MESSAGE_EOS) {
+      natural_end = true;
+      break;
+    }
+  }
+  if (natural_end) MarkPlaybackEnded();
+  gst_object_unref(bus);
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(pipeline);
+  return true;
+}
+#else
+bool PlayGstFile(const std::string& path) {
+  (void)path;
+  return false;
+}
+#endif
+
+void PlayAudioFile(const std::string& path) {
+  g_paused = false;
+  ResetPlaybackClock();
+  g_playing = true;
+  const bool ok =
+      PlayOpusFile(path) || PlayVorbisFile(path) || PlayGstFile(path);
+  if (!ok) {
+    std::fprintf(stderr, "ut_media: cannot play %s\n", path.c_str());
+    SignalPlayStart(false);
+  }
+  g_playing = false;
+  g_paused = false;
+}
+
+void StopAudioFile() {
+  g_paused = false;
   g_playing = false;
 }
 
-void StopAudioFile() { g_playing = false; }
+void PauseAudioFile() { g_paused = true; }
+
+void ResumeAudioFile() { g_paused = false; }
 
 void PlayBeep() {
   pa_sample_spec ss;
   ss.format = PA_SAMPLE_S16LE;
   ss.rate = 16000;
   ss.channels = 1;
-  int error = 0;
-  pa_simple* s = pa_simple_new(nullptr, "fluffychat", PA_STREAM_PLAYBACK, nullptr,
-                               "alert", &ss, nullptr, nullptr, &error);
-  if (!s) return;
   const int n = 16000 * 12 / 100;
   std::vector<int16_t> buf(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) {
@@ -560,6 +925,14 @@ void PlayBeep() {
         static_cast<int16_t>(std::sin(2.0 * 3.141592653589793 * freq * t) *
                              18000.0 * env);
   }
+  if (PlayPcmWithRole(&ss, buf.data(), buf.size() * sizeof(int16_t), "alert")) {
+    return;
+  }
+  int error = 0;
+  pa_simple* s =
+      pa_simple_new(nullptr, "fluffychat", PA_STREAM_PLAYBACK, nullptr,
+                    "alert", &ss, nullptr, nullptr, &error);
+  if (!s) return;
   pa_simple_write(s, buf.data(), buf.size() * sizeof(int16_t), &error);
   pa_simple_drain(s, &error);
   pa_simple_free(s);
@@ -575,24 +948,22 @@ void PlayXylo() {
       ss.format = PA_SAMPLE_S16LE;
       ss.rate = static_cast<uint32_t>(info->rate);
       ss.channels = static_cast<uint8_t>(info->channels);
-      int error = 0;
-      pa_simple* s =
-          pa_simple_new(nullptr, "fluffychat", PA_STREAM_PLAYBACK, nullptr,
-                        "alert", &ss, nullptr, nullptr, &error);
-      if (s) {
-        char pcm[4096];
-        int bitstream = 0;
-        long n = 0;
-        while ((n = ov_read(&vf, pcm, sizeof(pcm), 0, 2, 1, &bitstream)) > 0) {
-          pa_simple_write(s, pcm, static_cast<size_t>(n), &error);
-        }
-        pa_simple_drain(s, &error);
-        pa_simple_free(s);
-        ov_clear(&vf);
+      std::vector<char> pcm;
+      char chunk[4096];
+      int bitstream = 0;
+      long n = 0;
+      while ((n = ov_read(&vf, chunk, sizeof(chunk), 0, 2, 1, &bitstream)) >
+             0) {
+        pcm.insert(pcm.end(), chunk, chunk + n);
+      }
+      ov_clear(&vf);
+      if (!pcm.empty() &&
+          PlayPcmWithRole(&ss, pcm.data(), pcm.size(), "alert")) {
         return;
       }
+    } else {
+      ov_clear(&vf);
     }
-    ov_clear(&vf);
   }
 #endif
   PlayBeep();
@@ -650,6 +1021,8 @@ class UtMediaPlugin : public flutter::Plugin {
   std::mutex mu_;
   std::condition_variable start_cv_;
   std::thread thread_;
+  // Encoding a long clip takes seconds; it must not run on the platform thread.
+  std::thread stop_thread_;
   std::atomic<bool> running_{false};
   std::atomic<bool> paused_{false};
   std::atomic<double> amplitude_{-60.0};
@@ -676,6 +1049,7 @@ void UtMediaPlugin::RegisterWithRegistrar(flutter::PluginRegistrar* registrar) {
 }
 
 bool UtMediaPlugin::StartRecording(const std::string& path, std::string* error) {
+  if (stop_thread_.joinable()) stop_thread_.join();
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (running_) {
@@ -797,6 +1171,7 @@ bool UtMediaPlugin::StopRecording(std::string* path_out, std::string* error) {
 }
 
 void UtMediaPlugin::Cancel() {
+  if (stop_thread_.joinable()) stop_thread_.join();
   running_ = false;
   start_cv_.notify_all();
   if (thread_.joinable()) thread_.join();
@@ -805,6 +1180,187 @@ void UtMediaPlugin::Cancel() {
   path_.clear();
   start_done_ = false;
   start_ok_ = false;
+}
+
+void ParseVcard(const std::string& vcard, std::string* fn,
+                flutter::EncodableList* phones) {
+  std::istringstream in(vcard);
+  std::string line;
+  std::string pending;
+  auto flush = [&](const std::string& raw) {
+    if (raw.empty()) return;
+    const auto colon = raw.find(':');
+    if (colon == std::string::npos || colon == 0) return;
+    std::string key = raw.substr(0, colon);
+    const std::string val = raw.substr(colon + 1);
+    const auto semi = key.find(';');
+    if (semi != std::string::npos) key = key.substr(0, semi);
+    const bool is_fn = key == "FN" ||
+                       (key.size() > 3 &&
+                        key.compare(key.size() - 3, 3, ".FN") == 0);
+    const bool is_n = key == "N";
+    const bool is_tel = key == "TEL" ||
+                        (key.size() > 4 &&
+                         key.compare(key.size() - 4, 4, ".TEL") == 0);
+    if (is_fn && fn->empty()) {
+      *fn = val;
+    } else if (is_n && fn->empty()) {
+      std::string assembled;
+      std::string part;
+      std::istringstream nstream(val);
+      std::vector<std::string> parts;
+      while (std::getline(nstream, part, ';')) parts.push_back(part);
+      // vCard N: Family;Given;Additional;Prefix;Suffix
+      if (parts.size() > 1 && !parts[1].empty()) assembled = parts[1];
+      if (!parts.empty() && !parts[0].empty()) {
+        if (!assembled.empty()) assembled += " ";
+        assembled += parts[0];
+      }
+      if (!assembled.empty()) *fn = assembled;
+    } else if (is_tel && !val.empty()) {
+      phones->push_back(flutter::EncodableValue(val));
+    }
+  };
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (!line.empty() && (line[0] == ' ' || line[0] == '\t')) {
+      pending += line.substr(1);
+      continue;
+    }
+    flush(pending);
+    pending = line;
+  }
+  flush(pending);
+}
+
+void LogContacts(const char* msg) {
+  fprintf(stderr, "ut_media contacts: %s\n", msg);
+}
+
+flutter::EncodableList FetchContacts(std::string* error) {
+  flutter::EncodableList out;
+  GError* err = nullptr;
+  GDBusConnection* bus =
+      g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &err);
+  if (!bus) {
+    *error = err && err->message ? err->message : "no session bus";
+    LogContacts(error->c_str());
+    if (err) g_error_free(err);
+    return out;
+  }
+  auto query_source = [&](const char* source, GError** qerr) -> GVariant* {
+    GVariantBuilder builder;
+    g_variant_builder_init(&builder, G_VARIANT_TYPE("as"));
+    g_variant_builder_add(&builder, "s", "FULL_NAME");
+    g_variant_builder_add(&builder, "s", "PHONE");
+    GVariant* params =
+        g_variant_new("(ssibas)", source, "", static_cast<gint32>(0), FALSE,
+                      &builder);
+    return g_dbus_connection_call_sync(
+        bus, "com.lomiri.pim", "/com/lomiri/pim/AddressBook",
+        "com.lomiri.pim.AddressBook", "query", params, G_VARIANT_TYPE("(o)"),
+        G_DBUS_CALL_FLAGS_NONE, 30000, nullptr, qerr);
+  };
+  GError* qerr = nullptr;
+  GVariant* query = query_source("system-address-book", &qerr);
+  if (!query) {
+    *error = qerr && qerr->message ? qerr->message : "address-book query failed";
+    LogContacts(error->c_str());
+    if (qerr) g_error_free(qerr);
+    g_object_unref(bus);
+    return out;
+  }
+  if (qerr) g_error_free(qerr);
+  const gchar* view_path = nullptr;
+  g_variant_get(query, "(&o)", &view_path);
+  const std::string view = view_path ? view_path : "";
+  g_variant_unref(query);
+  if (view.empty()) {
+    *error = "empty address-book view";
+    LogContacts(error->c_str());
+    g_object_unref(bus);
+    return out;
+  }
+
+  GVariant* count_ret = g_dbus_connection_call_sync(
+      bus, "com.lomiri.pim", view.c_str(), "org.freedesktop.DBus.Properties",
+      "Get",
+      g_variant_new("(ss)", "com.lomiri.pim.AddressBookView", "count"),
+      G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 15000, nullptr, nullptr);
+  gint32 count = 0;
+  if (count_ret) {
+    GVariant* inner = nullptr;
+    g_variant_get(count_ret, "(v)", &inner);
+    if (inner) {
+      if (g_variant_is_of_type(inner, G_VARIANT_TYPE_INT32)) {
+        count = g_variant_get_int32(inner);
+      } else if (g_variant_is_of_type(inner, G_VARIANT_TYPE_UINT32)) {
+        count = static_cast<gint32>(g_variant_get_uint32(inner));
+      } else if (g_variant_is_of_type(inner, G_VARIANT_TYPE_INT64)) {
+        count = static_cast<gint32>(g_variant_get_int64(inner));
+      }
+      g_variant_unref(inner);
+    }
+    g_variant_unref(count_ret);
+  }
+  {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "view count=%d path=%s", count, view.c_str());
+    LogContacts(buf);
+  }
+
+  constexpr int kBatch = 200;
+  if (count <= 0) count = 100000;
+  for (gint32 start = 0; start < count; start += kBatch) {
+    const int n = std::min(kBatch, count - start);
+    GError* batch_err = nullptr;
+    GVariantBuilder details_fields;
+    g_variant_builder_init(&details_fields, G_VARIANT_TYPE("as"));
+    g_variant_builder_add(&details_fields, "s", "FULL_NAME");
+    g_variant_builder_add(&details_fields, "s", "PHONE");
+    GVariant* det = g_dbus_connection_call_sync(
+        bus, "com.lomiri.pim", view.c_str(), "com.lomiri.pim.AddressBookView",
+        "contactsDetails",
+        g_variant_new("(asii)", &details_fields, start, n),
+        G_VARIANT_TYPE("(as)"), G_DBUS_CALL_FLAGS_NONE, 30000, nullptr,
+        &batch_err);
+    if (!det) {
+      if (out.empty()) {
+        *error = batch_err && batch_err->message
+                     ? batch_err->message
+                     : "contactsDetails failed";
+        LogContacts(error->c_str());
+      }
+      if (batch_err) g_error_free(batch_err);
+      break;
+    }
+    GVariantIter* iter = nullptr;
+    g_variant_get(det, "(as)", &iter);
+    const gchar* vcard = nullptr;
+    int got = 0;
+    while (g_variant_iter_loop(iter, "s", &vcard)) {
+      ++got;
+      if (!vcard) continue;
+      std::string fn;
+      flutter::EncodableList phones;
+      ParseVcard(vcard, &fn, &phones);
+      if (fn.empty() || phones.empty()) continue;
+      flutter::EncodableMap row;
+      row[flutter::EncodableValue("name")] = flutter::EncodableValue(fn);
+      row[flutter::EncodableValue("phones")] = phones;
+      out.push_back(flutter::EncodableValue(row));
+    }
+    g_variant_iter_free(iter);
+    g_variant_unref(det);
+    if (got < n) break;
+  }
+
+  g_dbus_connection_call_sync(
+      bus, "com.lomiri.pim", view.c_str(), "com.lomiri.pim.AddressBookView",
+      "close", nullptr, nullptr, G_DBUS_CALL_FLAGS_NONE, 5000, nullptr,
+      nullptr);
+  g_object_unref(bus);
+  return out;
 }
 
 void UtMediaPlugin::HandleMethodCall(
@@ -823,12 +1379,61 @@ void UtMediaPlugin::HandleMethodCall(
       return;
     }
     StopAudioFile();
+    g_play_start = 0;
     std::thread([p = *path]() { PlayAudioFile(p); }).detach();
+    std::unique_lock<std::mutex> lock(g_play_mu);
+    if (!g_play_cv.wait_for(lock, std::chrono::seconds(8),
+                            [] { return g_play_start.load() != 0; })) {
+      StopAudioFile();
+      result->Error("PLAY", "Timed out starting playback");
+      return;
+    }
+    if (g_play_start.load() < 0) {
+      result->Error("PLAY", "Unable to play this audio file");
+      return;
+    }
     result->Success(flutter::EncodableValue());
     return;
   }
   if (method == "stopPlayback") {
     StopAudioFile();
+    result->Success(flutter::EncodableValue());
+    return;
+  }
+  if (method == "pausePlayback") {
+    PauseAudioFile();
+    result->Success(flutter::EncodableValue());
+    return;
+  }
+  if (method == "resumePlayback") {
+    ResumeAudioFile();
+    result->Success(flutter::EncodableValue());
+    return;
+  }
+  if (method == "playbackPosition") {
+    flutter::EncodableMap map;
+    map[flutter::EncodableValue("positionMs")] = flutter::EncodableValue(
+        static_cast<int32_t>(g_position_ms.load()));
+    map[flutter::EncodableValue("durationMs")] = flutter::EncodableValue(
+        static_cast<int32_t>(g_duration_ms.load()));
+    map[flutter::EncodableValue("playing")] =
+        flutter::EncodableValue(g_playing.load() ? 1 : 0);
+    result->Success(flutter::EncodableValue(std::move(map)));
+    return;
+  }
+  if (method == "seekPlayback") {
+    int64_t ms = -1;
+    if (const auto* v = std::get_if<int32_t>(call.arguments())) {
+      ms = *v;
+    } else if (const auto* v64 = std::get_if<int64_t>(call.arguments())) {
+      ms = *v64;
+    }
+    if (ms < 0) {
+      result->Error("INVALID_ARGS", "Missing positionMs");
+      return;
+    }
+    g_seek_to_ms.store(ms);
+    g_position_ms.store(ms);
     result->Success(flutter::EncodableValue());
     return;
   }
@@ -852,13 +1457,16 @@ void UtMediaPlugin::HandleMethodCall(
     return;
   }
   if (method == "stopRecording") {
-    std::string path;
-    std::string error;
-    if (!StopRecording(&path, &error)) {
-      result->Error("RECORD", error);
-      return;
-    }
-    result->Success(flutter::EncodableValue(path));
+    if (stop_thread_.joinable()) stop_thread_.join();
+    stop_thread_ = std::thread([this, res = std::move(result)]() mutable {
+      std::string path;
+      std::string error;
+      if (!StopRecording(&path, &error)) {
+        res->Error("RECORD", error);
+        return;
+      }
+      res->Success(flutter::EncodableValue(path));
+    });
     return;
   }
   if (method == "cancelRecording") {
@@ -878,6 +1486,19 @@ void UtMediaPlugin::HandleMethodCall(
   }
   if (method == "amplitude") {
     result->Success(flutter::EncodableValue(amplitude_.load()));
+    return;
+  }
+  if (method == "listContacts") {
+    std::string error;
+    auto list = FetchContacts(&error);
+    if (!error.empty() && list.empty()) {
+      result->Error("CONTACTS", error);
+      return;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "loaded %zu contacts", list.size());
+    LogContacts(buf);
+    result->Success(flutter::EncodableValue(std::move(list)));
     return;
   }
   result->NotImplemented();

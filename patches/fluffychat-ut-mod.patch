@@ -1,8 +1,96 @@
+diff --git a/lib/config/themes.dart b/lib/config/themes.dart
+index 17594b67e..2bc665f34 100644
+--- a/lib/config/themes.dart
++++ b/lib/config/themes.dart
+@@ -5,6 +5,7 @@
+ 
+ import 'package:fluffychat/config/app_config.dart';
+ import 'package:fluffychat/config/setting_keys.dart';
++import 'package:fluffychat/utils/platform_infos.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter/services.dart';
+ 
+@@ -120,6 +121,16 @@ abstract class FluffyThemes {
+               width: FluffyThemes.columnWidth * 1.5,
+             )
+           : const SnackBarThemeData(behavior: SnackBarBehavior.floating),
++      // Ubuntu Touch is Linux: hover/long-press IconButton tooltips would
++      // otherwise pop name bubbles on tap. Manual + huge wait = never show.
++      tooltipTheme: PlatformInfos.isLinux
++          ? const TooltipThemeData(
++              waitDuration: Duration(days: 1),
++              showDuration: Duration.zero,
++              triggerMode: TooltipTriggerMode.manual,
++              excludeFromSemantics: true,
++            )
++          : const TooltipThemeData(),
+       elevatedButtonTheme: ElevatedButtonThemeData(
+         style: ElevatedButton.styleFrom(
+           backgroundColor: colorScheme.secondaryContainer,
+diff --git a/lib/pages/chat/chat_app_bar_title.dart b/lib/pages/chat/chat_app_bar_title.dart
+index 6cbf900c2..6a366bd81 100644
+--- a/lib/pages/chat/chat_app_bar_title.dart
++++ b/lib/pages/chat/chat_app_bar_title.dart
+@@ -8,6 +8,7 @@ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/pages/chat/chat.dart';
+ import 'package:fluffychat/utils/date_time_extension.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/sync_status_localization.dart';
+ import 'package:fluffychat/utils/verified_room_extension.dart';
+ import 'package:fluffychat/widgets/avatar.dart';
+@@ -31,7 +32,9 @@ class ChatAppBarTitle extends StatelessWidget {
+         ),
+       );
+     }
+-    return InkWell(
++    return ValueListenableBuilder<int>(
++      valueListenable: ContactBook.revision,
++      builder: (context, _, __) => InkWell(
+       hoverColor: Colors.transparent,
+       splashColor: Colors.transparent,
+       highlightColor: Colors.transparent,
+@@ -46,7 +49,7 @@ class ChatAppBarTitle extends StatelessWidget {
+             tag: 'content_banner',
+             child: Avatar(
+               mxContent: room.avatar,
+-              name: room.getLocalizedDisplayname(
++              name: room.uiDisplayname(
+                 MatrixLocals(L10n.of(context)),
+               ),
+               size: 32,
+@@ -68,7 +71,7 @@ class ChatAppBarTitle extends StatelessWidget {
+                       ),
+                     Expanded(
+                       child: Text(
+-                        room.getLocalizedDisplayname(
++                        room.uiDisplayname(
+                           MatrixLocals(L10n.of(context)),
+                         ),
+                         maxLines: 1,
+@@ -188,6 +191,7 @@ class ChatAppBarTitle extends StatelessWidget {
+           ),
+         ],
+       ),
++    ),
+     );
+   }
+ }
 diff --git a/lib/pages/chat/chat_input_row.dart b/lib/pages/chat/chat_input_row.dart
-index 879717fa9..1ed623748 100644
+index 879717fa9..e49393960 100644
 --- a/lib/pages/chat/chat_input_row.dart
 +++ b/lib/pages/chat/chat_input_row.dart
-@@ -341,7 +341,7 @@ class ChatInputRow extends StatelessWidget {
+@@ -287,7 +287,8 @@ class ChatInputRow extends StatelessWidget {
+                         room: controller.room,
+                         minLines: 1,
+                         maxLines: 8,
+-                        autofocus: !PlatformInfos.isMobile,
++                        autofocus:
++                            !PlatformInfos.isMobile && !PlatformInfos.isLinux,
+                         keyboardType: TextInputType.multiline,
+                         textInputAction:
+                             AppSettings.sendOnEnter.value == true &&
+@@ -341,7 +342,7 @@ class ChatInputRow extends StatelessWidget {
                          ? HoverBuilder(
                              builder: (context, hovered) => IconButton(
                                tooltip: L10n.of(context).voiceMessage,
@@ -12,7 +100,7 @@ index 879717fa9..1ed623748 100644
                                        controller.room,
                                      )
 diff --git a/lib/pages/chat/events/audio_player.dart b/lib/pages/chat/events/audio_player.dart
-index e5b54c10a..3574b9597 100644
+index e5b54c10a..46e2c72bc 100644
 --- a/lib/pages/chat/events/audio_player.dart
 +++ b/lib/pages/chat/events/audio_player.dart
 @@ -12,6 +12,7 @@ import 'package:fluffychat/config/themes.dart';
@@ -31,21 +119,135 @@ index e5b54c10a..3574b9597 100644
  
  import '../../../utils/matrix_sdk_extensions/event_extension.dart';
  import '../../../widgets/fluffy_chat_app.dart';
-@@ -131,6 +133,13 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
+@@ -56,9 +58,106 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
+   late final MatrixState matrix;
+   List<int>? _waveform;
+   String? _durationString;
++  Timer? _linuxPlayhead;
++  Duration _linuxDuration = Duration.zero;
++  Duration _linuxElapsed = Duration.zero;
++  bool _linuxPaused = false;
++  bool _linuxDragging = false;
++  bool _linuxTickBusy = false;
++
++  void _stopLinuxPlayhead() {
++    _linuxPlayhead?.cancel();
++    _linuxPlayhead = null;
++    _linuxElapsed = Duration.zero;
++    _linuxPaused = false;
++    _linuxDragging = false;
++    _linuxTickBusy = false;
++  }
++
++  void _pauseLinuxPlayhead() {
++    _linuxPlayhead?.cancel();
++    _linuxPlayhead = null;
++    _linuxPaused = true;
++  }
++
++  void _resumeLinuxPlayhead() {
++    _linuxPaused = false;
++    _linuxPlayhead?.cancel();
++    _linuxPlayhead = Timer.periodic(const Duration(milliseconds: 100), (_) {
++      _tickLinuxPlayhead();
++    });
++    _tickLinuxPlayhead();
++  }
++
++  void _tickLinuxPlayhead() {
++    if (_linuxTickBusy) return;
++    _linuxTickBusy = true;
++    () async {
++      try {
++        await _pollLinuxPlayhead();
++      } finally {
++        _linuxTickBusy = false;
++      }
++    }();
++  }
++
++  Future<void> _pollLinuxPlayhead() async {
++    if (!mounted) return;
++    if (matrix.voiceMessageEventId.value != widget.event.eventId) {
++      _stopLinuxPlayhead();
++      return;
++    }
++    if (!_linuxDragging) {
++      try {
++        final pos = await UtMedia.playbackPosition();
++        if (!mounted) return;
++        if (matrix.voiceMessageEventId.value != widget.event.eventId) {
++          _stopLinuxPlayhead();
++          return;
++        }
++        _linuxElapsed = Duration(milliseconds: pos['positionMs'] ?? 0);
++        final durationMs = pos['durationMs'] ?? 0;
++        if (durationMs > 0) {
++          _linuxDuration = Duration(milliseconds: durationMs);
++        }
++        final nativePlaying = (pos['playing'] ?? 0) != 0;
++        if (!nativePlaying && !_linuxPaused) {
++          _stopLinuxPlayhead();
++          matrix.voiceMessageEventId.value = null;
++          if (mounted) setState(() {});
++          return;
++        }
++      } catch (_) {}
++    }
++    if (!mounted) return;
++    setState(() {});
++    if (_linuxPaused) return;
++    if (_linuxDuration > Duration.zero && _linuxElapsed >= _linuxDuration) {
++      _stopLinuxPlayhead();
++      matrix.voiceMessageEventId.value = null;
++      if (mounted) setState(() {});
++    }
++  }
++
++  void _startLinuxPlayhead() {
++    _stopLinuxPlayhead();
++    final durationMs =
++        widget.event.content
++            .tryGetMap<String, Object?>('info')
++            ?.tryGet<int>('duration') ??
++        0;
++    _linuxDuration = Duration(milliseconds: durationMs > 0 ? durationMs : 0);
++    _linuxElapsed = Duration.zero;
++    _linuxPaused = false;
++    _linuxPlayhead = Timer.periodic(const Duration(milliseconds: 100), (_) {
++      _tickLinuxPlayhead();
++    });
++    _tickLinuxPlayhead();
++  }
+ 
+   @override
+   void dispose() {
++    _stopLinuxPlayhead();
+     super.dispose();
+     final audioPlayer = matrix.voiceMessageEventId.value != widget.event.eventId
+         ? null
+@@ -131,6 +230,20 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
      WidgetsBinding.instance.addPostFrameCallback((_) {
        ScaffoldMessenger.of(matrix.context).clearMaterialBanners();
      });
 +    if (PlatformInfos.isLinux &&
 +        matrix.voiceMessageEventId.value == widget.event.eventId) {
-+      await UtMedia.stopPlayback();
-+      matrix.voiceMessageEventId.value = null;
++      if (_linuxPaused) {
++        await UtMedia.resumePlayback();
++        _resumeLinuxPlayhead();
++        if (mounted) setState(() {});
++        return;
++      }
++      await UtMedia.pausePlayback();
++      _pauseLinuxPlayhead();
++      if (mounted) setState(() {});
 +      return;
 +    }
 +
      final currentPlayer =
          matrix.voiceMessageEventId.value != widget.event.eventId
          ? null
-@@ -172,7 +181,13 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
+@@ -172,7 +285,13 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
        final attachmentUrl = widget.event.attachmentOrThumbnailMxcUrl();
  
        if (!kIsWeb && attachmentUrl != null) {
@@ -60,7 +262,7 @@ index e5b54c10a..3574b9597 100644
          final fileName = Uri.encodeComponent(attachmentUrl.pathSegments.last);
          file = File('${tempDir.path}/${fileName}_${matrixFile.name}');
  
-@@ -203,6 +218,23 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
+@@ -203,6 +322,34 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
      if (!context.mounted) return;
      if (matrix.voiceMessageEventId.value != widget.event.eventId) return;
  
@@ -76,19 +278,220 @@ index e5b54c10a..3574b9597 100644
 +        );
 +        await file.writeAsBytes(matrixFile.bytes);
 +      }
-+      await UtMedia.stopPlayback();
-+      await UtMedia.playFile(file.path);
++      try {
++        await UtMedia.stopPlayback();
++        await UtMedia.playFile(file.path);
++      } catch (e, s) {
++        Logs().w('Unable to play audio message', e, s);
++        matrix.voiceMessageEventId.value = null;
++        if (!mounted) return;
++        ScaffoldMessenger.of(context).showSnackBar(
++          SnackBar(content: Text(e.toLocalizedString(context))),
++        );
++        return;
++      }
++      _startLinuxPlayhead();
 +      return;
 +    }
 +
      final audioPlayer = matrix.audioPlayer = AudioPlayer();
  
      if (file != null) {
+@@ -299,6 +446,8 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
+         final audioPlayer = eventId != widget.event.eventId
+             ? null
+             : matrix.audioPlayer;
++        final linuxPlaying =
++            PlatformInfos.isLinux && eventId == widget.event.eventId;
+ 
+         final fileDescription = widget.event.fileDescription;
+ 
+@@ -310,18 +459,34 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
+                   audioPlayer.playerStateStream.asBroadcastStream(),
+                 ]),
+           builder: (context, _) {
+-            final maxPosition =
++            var maxPosition =
+                 audioPlayer?.duration?.inMilliseconds.toDouble() ?? 1.0;
+             var currentPosition =
+                 audioPlayer?.position.inMilliseconds.toDouble() ?? 0.0;
++            if (linuxPlaying) {
++              currentPosition = _linuxElapsed.inMilliseconds.toDouble();
++              if (_linuxDuration > Duration.zero) {
++                maxPosition = _linuxDuration.inMilliseconds.toDouble();
++              } else if (currentPosition > 0) {
++                maxPosition = currentPosition + 1;
++              }
++            }
+             if (currentPosition > maxPosition) currentPosition = maxPosition;
+ 
+             final wavePosition =
+                 (currentPosition / maxPosition) * AudioPlayerWidget.wavesCount;
+-
+-            final statusText = audioPlayer == null
+-                ? _durationString ?? '00:00'
+-                : audioPlayer.position.minuteSecondString;
++            final playing =
++                (audioPlayer?.playing == true &&
++                    audioPlayer?.isAtEndPosition == false) ||
++                (linuxPlaying && _linuxPlayhead != null && !_linuxPaused);
++
++            final statusText = audioPlayer != null
++                ? audioPlayer.position.minuteSecondString
++                : linuxPlaying
++                ? Duration(
++                    milliseconds: currentPosition.round(),
++                  ).minuteSecondString
++                : _durationString ?? '00:00';
+             return Padding(
+               padding: const EdgeInsets.all(12.0),
+               child: Column(
+@@ -353,9 +518,7 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
+                                     color: widget.color.withAlpha(64),
+                                     borderRadius: BorderRadius.circular(64),
+                                     child: Icon(
+-                                      audioPlayer?.playing == true &&
+-                                              audioPlayer?.isAtEndPosition ==
+-                                                  false
++                                      playing
+                                           ? Icons.pause_outlined
+                                           : Icons.play_arrow_outlined,
+                                       color: widget.color,
+@@ -420,13 +583,49 @@ class AudioPlayerState extends State<AudioPlayerWidget> {
+                                       : Colors.transparent,
+                                   max: maxPosition,
+                                   value: currentPosition,
+-                                  onChanged: (position) => audioPlayer == null
+-                                      ? _onButtonTap()
+-                                      : audioPlayer.seek(
+-                                          Duration(
+-                                            milliseconds: position.round(),
+-                                          ),
++                                  onChangeStart: PlatformInfos.isLinux
++                                      ? (_) {
++                                          if (linuxPlaying) {
++                                            _linuxDragging = true;
++                                          }
++                                        }
++                                      : null,
++                                  onChanged: (position) {
++                                    if (PlatformInfos.isLinux) {
++                                      if (!linuxPlaying) {
++                                        _onButtonTap();
++                                        return;
++                                      }
++                                      setState(() {
++                                        _linuxElapsed = Duration(
++                                          milliseconds: position.round(),
++                                        );
++                                      });
++                                      return;
++                                    }
++                                    if (audioPlayer == null) {
++                                      _onButtonTap();
++                                    } else {
++                                      audioPlayer.seek(
++                                        Duration(
++                                          milliseconds: position.round(),
+                                         ),
++                                      );
++                                    }
++                                  },
++                                  onChangeEnd: PlatformInfos.isLinux
++                                      ? (position) {
++                                          if (linuxPlaying) {
++                                            _linuxElapsed = Duration(
++                                              milliseconds: position.round(),
++                                            );
++                                            UtMedia.seekPlayback(
++                                              position.round(),
++                                            );
++                                          }
++                                          _linuxDragging = false;
++                                        }
++                                      : null,
+                                 ),
+                               ),
+                             ],
+diff --git a/lib/pages/chat/events/html_message.dart b/lib/pages/chat/events/html_message.dart
+index 9dd1bdef4..ed3490a01 100644
+--- a/lib/pages/chat/events/html_message.dart
++++ b/lib/pages/chat/events/html_message.dart
+@@ -8,6 +8,7 @@ import 'package:fluffychat/config/setting_keys.dart';
+ import 'package:fluffychat/config/themes.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/utils/code_highlight_theme.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/event_checkbox_extension.dart';
+ import 'package:fluffychat/widgets/avatar.dart';
+ import 'package:fluffychat/widgets/future_loading_dialog.dart';
+@@ -195,7 +196,7 @@ class HtmlMessage extends StatelessWidget {
+             return WidgetSpan(
+               child: MatrixPill(
+                 key: Key('user_pill_$matrixId'),
+-                name: user.calcDisplayname(),
++                name: user.uiDisplayname(),
+                 avatar: user.avatarUrl,
+                 uri: href,
+                 outerContext: context,
+diff --git a/lib/pages/chat/events/message.dart b/lib/pages/chat/events/message.dart
+index d43470011..966df4c04 100644
+--- a/lib/pages/chat/events/message.dart
++++ b/lib/pages/chat/events/message.dart
+@@ -11,6 +11,7 @@ import 'package:fluffychat/config/setting_keys.dart';
+ import 'package:fluffychat/config/themes.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/utils/adaptive_bottom_sheet.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/date_time_extension.dart';
+ import 'package:fluffychat/utils/file_description.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
+@@ -300,7 +301,7 @@ class Message extends StatelessWidget {
+                             final user = snapshot.data ?? sender;
+                             return Avatar(
+                               mxContent: user.avatarUrl,
+-                              name: user.calcDisplayname(),
++                              name: user.uiDisplayname(),
+                               onTap: () => showMemberActionsPopupMenu(
+                                 context: context,
+                                 user: user,
+@@ -348,9 +349,12 @@ class Message extends StatelessWidget {
+                                     FutureBuilder<User?>(
+                                       future: event.fetchSenderUser(),
+                                       builder: (context, snapshot) {
++                                        return ValueListenableBuilder<int>(
++                                          valueListenable: ContactBook.revision,
++                                          builder: (context, _, __) {
+                                         final displayname =
+-                                            snapshot.data?.calcDisplayname() ??
+-                                            sender.calcDisplayname();
++                                            snapshot.data?.uiDisplayname() ??
++                                            sender.uiDisplayname();
+                                         return ConstrainedBox(
+                                           constraints: BoxConstraints(
+                                             maxWidth: 200,
+@@ -376,6 +380,8 @@ class Message extends StatelessWidget {
+                                             overflow: TextOverflow.ellipsis,
+                                           ),
+                                         );
++                                          },
++                                        );
+                                       },
+                                     ),
+                                 ],
 diff --git a/lib/pages/chat/events/message_content.dart b/lib/pages/chat/events/message_content.dart
-index 91fffa01f..30e2641a9 100644
+index 91fffa01f..95f03c0f9 100644
 --- a/lib/pages/chat/events/message_content.dart
 +++ b/lib/pages/chat/events/message_content.dart
-@@ -104,11 +104,8 @@ class MessageContent extends StatelessWidget {
+@@ -14,6 +14,7 @@ import 'package:flutter/material.dart';
+ import 'package:matrix/matrix.dart';
+ 
+ import '../../../config/app_config.dart';
++import '../../../utils/contact_book.dart';
+ import '../../../utils/event_checkbox_extension.dart';
+ import '../../../utils/platform_infos.dart';
+ import '../../../utils/url_launcher.dart';
+@@ -104,11 +105,8 @@ class MessageContent extends StatelessWidget {
            case MessageTypes.Audio:
              if (PlatformInfos.isMobile ||
                  PlatformInfos.isMacOS ||
@@ -102,6 +505,58 @@ index 91fffa01f..30e2641a9 100644
                return AudioPlayerWidget(
                  event,
                  color: textColor,
+@@ -224,8 +222,8 @@ class MessageContent extends StatelessWidget {
+           builder: (context, snapshot) {
+             return _ButtonContent(
+               label: L10n.of(context).startedACall(
+-                snapshot.data?.calcDisplayname() ??
+-                    event.senderFromMemoryOrFallback.calcDisplayname(),
++                snapshot.data?.uiDisplayname() ??
++                    event.senderFromMemoryOrFallback.uiDisplayname(),
+               ),
+               icon: '📞',
+               textColor: buttonTextColor,
+@@ -240,8 +238,8 @@ class MessageContent extends StatelessWidget {
+           builder: (context, snapshot) {
+             return _ButtonContent(
+               label: L10n.of(context).userSentUnknownEvent(
+-                snapshot.data?.calcDisplayname() ??
+-                    event.senderFromMemoryOrFallback.calcDisplayname(),
++                snapshot.data?.uiDisplayname() ??
++                    event.senderFromMemoryOrFallback.uiDisplayname(),
+                 event.type,
+               ),
+               icon: 'ℹ️',
+@@ -276,7 +274,7 @@ class RedactionWidget extends StatelessWidget {
+       builder: (context, snapshot) {
+         final reason = event.redactedBecause?.content.tryGet<String>('reason');
+         final redactedBy =
+-            snapshot.data?.calcDisplayname() ??
++            snapshot.data?.uiDisplayname() ??
+             event.redactedBecause?.senderId.localpart ??
+             L10n.of(context).user;
+         return _ButtonContent(
+diff --git a/lib/pages/chat/events/reply_content.dart b/lib/pages/chat/events/reply_content.dart
+index 6f9ce424e..2d95c8eb0 100644
+--- a/lib/pages/chat/events/reply_content.dart
++++ b/lib/pages/chat/events/reply_content.dart
+@@ -4,6 +4,7 @@
+ // SPDX-License-Identifier: AGPL-3.0-or-later
+ 
+ import 'package:fluffychat/l10n/l10n.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
+ import 'package:flutter/material.dart';
+ import 'package:matrix/matrix.dart';
+@@ -67,7 +68,7 @@ class ReplyContent extends StatelessWidget {
+                   future: displayEvent.fetchSenderUser(),
+                   builder: (context, snapshot) {
+                     return Text(
+-                      '${snapshot.data?.calcDisplayname() ?? displayEvent.senderFromMemoryOrFallback.calcDisplayname()}:',
++                      '${snapshot.data?.uiDisplayname() ?? displayEvent.senderFromMemoryOrFallback.uiDisplayname()}:',
+                       maxLines: 1,
+                       overflow: TextOverflow.ellipsis,
+                       style: TextStyle(
 diff --git a/lib/pages/chat/recording_view_model.dart b/lib/pages/chat/recording_view_model.dart
 index 7d9d886d4..f83d3a070 100644
 --- a/lib/pages/chat/recording_view_model.dart
@@ -252,6 +707,2115 @@ index 7d9d886d4..f83d3a070 100644
  
      if (path == null) throw ('Recording failed!');
      const waveCount = AudioPlayerWidget.wavesCount;
+diff --git a/lib/pages/chat/typing_indicators.dart b/lib/pages/chat/typing_indicators.dart
+index 2742ed903..d4eaa6043 100644
+--- a/lib/pages/chat/typing_indicators.dart
++++ b/lib/pages/chat/typing_indicators.dart
+@@ -6,6 +6,7 @@
+ import 'package:fluffychat/config/app_config.dart';
+ import 'package:fluffychat/config/themes.dart';
+ import 'package:fluffychat/pages/chat/chat.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/widgets/avatar.dart';
+ import 'package:fluffychat/widgets/matrix.dart';
+ import 'package:fluffychat/widgets/typing_animation.dart';
+@@ -64,7 +65,7 @@ class TypingIndicators extends StatelessWidget {
+                         Avatar(
+                           size: avatarSize,
+                           mxContent: typingUsers.first.avatarUrl,
+-                          name: typingUsers.first.calcDisplayname(),
++                          name: typingUsers.first.uiDisplayname(),
+                         ),
+                       if (typingUsers.length == 2)
+                         Padding(
+@@ -75,7 +76,7 @@ class TypingIndicators extends StatelessWidget {
+                                 ? typingUsers.last.avatarUrl
+                                 : null,
+                             name: typingUsers.length == 2
+-                                ? typingUsers.last.calcDisplayname()
++                                ? typingUsers.last.uiDisplayname()
+                                 : '+${typingUsers.length - 1}',
+                           ),
+                         ),
+diff --git a/lib/pages/chat_details/chat_details_view.dart b/lib/pages/chat_details/chat_details_view.dart
+index a13e841e8..5999cf69d 100644
+--- a/lib/pages/chat_details/chat_details_view.dart
++++ b/lib/pages/chat_details/chat_details_view.dart
+@@ -8,6 +8,7 @@ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/pages/chat_details/chat_details.dart';
+ import 'package:fluffychat/pages/chat_details/participant_list_item.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/verified_room_extension.dart';
+ import 'package:fluffychat/widgets/avatar.dart';
+ import 'package:fluffychat/widgets/chat_settings_popup_menu.dart';
+@@ -58,7 +59,7 @@ class ChatDetailsView extends StatelessWidget {
+             (room.summary.mJoinedMemberCount ?? 0);
+         final canRequestMoreMembers = members.length < actualMembersCount;
+         final iconColor = theme.textTheme.bodyLarge!.color;
+-        final displayname = room.getLocalizedDisplayname(
++        final displayname = room.uiDisplayname(
+           MatrixLocals(L10n.of(context)),
+         );
+         return Scaffold(
+diff --git a/lib/pages/chat_details/participant_list_item.dart b/lib/pages/chat_details/participant_list_item.dart
+index 79a561c51..09b1ed39f 100644
+--- a/lib/pages/chat_details/participant_list_item.dart
++++ b/lib/pages/chat_details/participant_list_item.dart
+@@ -5,6 +5,7 @@
+ 
+ import 'package:fluffychat/config/app_config.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/widgets/member_actions_popup_menu_button.dart';
+ import 'package:flutter/material.dart';
+ import 'package:matrix/matrix.dart';
+@@ -39,7 +40,9 @@ class ParticipantListItem extends StatelessWidget {
+         user.powerLevel.role == PowerLevelRole.admin ||
+         user.powerLevel.role == PowerLevelRole.owner;
+ 
+-    return ListTile(
++    return ValueListenableBuilder<int>(
++      valueListenable: ContactBook.revision,
++      builder: (context, _, __) => ListTile(
+       onTap: () => showMemberActionsPopupMenu(context: context, user: user),
+       title: Row(
+         children: <Widget>[
+@@ -55,7 +58,7 @@ class ParticipantListItem extends StatelessWidget {
+             ),
+           Expanded(
+             child: Text(
+-              user.calcDisplayname(),
++              user.uiDisplayname(),
+               overflow: TextOverflow.ellipsis,
+             ),
+           ),
+@@ -105,10 +108,11 @@ class ParticipantListItem extends StatelessWidget {
+         opacity: user.membership == Membership.join ? 1 : 0.5,
+         child: Avatar(
+           mxContent: user.avatarUrl,
+-          name: user.calcDisplayname(),
++          name: user.uiDisplayname(),
+           presenceUserId: user.stateKey,
+         ),
+       ),
++    ),
+     );
+   }
+ }
+diff --git a/lib/pages/chat_list/chat_list.dart b/lib/pages/chat_list/chat_list.dart
+index dc5d8a4ac..fe21fbff6 100644
+--- a/lib/pages/chat_list/chat_list.dart
++++ b/lib/pages/chat_list/chat_list.dart
+@@ -10,6 +10,8 @@ import 'package:cross_file/cross_file.dart';
+ import 'package:fluffychat/config/app_config.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/pages/chat_list/chat_list_view.dart';
++import 'package:fluffychat/pages/chat_list/space_sidebar.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/error_reporter.dart';
+ import 'package:fluffychat/utils/localized_exception_extension.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
+@@ -275,6 +277,12 @@ class ChatListController extends State<ChatList>
+     });
+   }
+ 
++  void refreshUi() => setState(() {});
++
++  Future<void> organizeSpaces() async {
++    await showOrganizeSpacesSheet(context, onChanged: refreshUi);
++  }
++
+   void startSearch() {
+     setState(() {
+       isSearchMode = true;
+@@ -285,6 +293,7 @@ class ChatListController extends State<ChatList>
+   }
+ 
+   void cancelSearch({bool unfocus = true}) {
++    _coolDown?.cancel();
+     setState(() {
+       searchController.clear();
+       isSearchMode = false;
+@@ -506,6 +515,21 @@ class ChatListController extends State<ChatList>
+             ),
+           ),
+         if (room.membership == Membership.join) ...[
++          PopupMenuItem(
++            value: ChatContextAction.details,
++            child: Row(
++              mainAxisSize: .min,
++              children: [
++                const Icon(Icons.info_outline_rounded),
++                const SizedBox(width: 12),
++                Text(
++                  room.isSpace
++                      ? L10n.of(context).settings
++                      : L10n.of(context).chatDetails,
++                ),
++              ],
++            ),
++          ),
+           PopupMenuItem(
+             value: ChatContextAction.mute,
+             child: Row(
+@@ -691,6 +715,11 @@ class ChatListController extends State<ChatList>
+       case ChatContextAction.goToSpace:
+         setActiveSpace(space!.id);
+         return;
++      case ChatContextAction.details:
++        await room.postLoad();
++        if (!mounted) return;
++        context.push('/rooms/${room.id}/details');
++        return;
+       case ChatContextAction.favorite:
+         await showFutureLoadingDialog(
+           context: context,
+@@ -864,6 +893,7 @@ class ChatListController extends State<ChatList>
+     final router = GoRouter.of(context);
+     final client = Matrix.of(context).client;
+     await client.roomsLoading;
++    ContactBook.learnFromClient(client);
+     await client.accountDataLoading;
+     await client.userDeviceKeysLoading;
+     if (client.prevBatch == null) {
+@@ -877,6 +907,7 @@ class ChatListController extends State<ChatList>
+       });
+     }
+     if (!mounted) return;
++    ContactBook.learnFromClient(client);
+     setState(() {
+       waitForFirstSync = true;
+     });
+@@ -1029,6 +1060,7 @@ enum EditBundleAction { addToBundle, removeFromBundle }
+ 
+ enum ChatContextAction {
+   goToSpace,
++  details,
+   favorite,
+   lowPriority,
+   addTag,
+diff --git a/lib/pages/chat_list/chat_list_body.dart b/lib/pages/chat_list/chat_list_body.dart
+index 8610b9253..a9255d687 100644
+--- a/lib/pages/chat_list/chat_list_body.dart
++++ b/lib/pages/chat_list/chat_list_body.dart
+@@ -10,6 +10,8 @@ import 'package:fluffychat/pages/chat_list/chat_list_item.dart';
+ import 'package:fluffychat/pages/chat_list/dummy_chat_list_item.dart';
+ import 'package:fluffychat/pages/chat_list/search_title.dart';
+ import 'package:fluffychat/pages/chat_list/space_view.dart';
++import 'package:fluffychat/utils/contact_book.dart';
++import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
+ import 'package:fluffychat/utils/stream_extension.dart';
+ import 'package:fluffychat/widgets/adaptive_dialogs/public_room_dialog.dart';
+ import 'package:fluffychat/widgets/avatar.dart';
+@@ -40,6 +42,7 @@ class ChatListViewBody extends StatelessWidget {
+         onBack: controller.clearActiveSpace,
+         onChatTab: controller.onChatTap,
+         activeChat: controller.activeChat,
++        onSidebarChanged: controller.refreshUi,
+       );
+     }
+     final spaces = client.rooms.where((r) => r.isSpace);
+@@ -73,6 +76,14 @@ class ChatListViewBody extends StatelessWidget {
+                   !AppSettings.hideRoomsInSpaces.value ||
+                   spaceDelegateCandidates[room.id] == null,
+             )
++            .where((room) {
++              if (filter.isEmpty) return true;
++              final i18n = MatrixLocals(L10n.of(context));
++              return room.uiDisplayname(i18n).toLowerCase().contains(filter) ||
++                  room.getLocalizedDisplayname(i18n).toLowerCase().contains(
++                    filter,
++                  );
++            })
+             .toList();
+ 
+         return CustomScrollView(
+@@ -244,7 +255,6 @@ class ChatListViewBody extends StatelessWidget {
+                       room,
+                       space: space,
+                       key: Key('chat_list_item_${room.id}'),
+-                      filter: filter,
+                       onTap: () => controller.onChatTap(room),
+                       onLongPress: (context) =>
+                           controller.chatContextAction(room, context, space),
+diff --git a/lib/pages/chat_list/chat_list_item.dart b/lib/pages/chat_list/chat_list_item.dart
+index 01e93717d..a51264a08 100644
+--- a/lib/pages/chat_list/chat_list_item.dart
++++ b/lib/pages/chat_list/chat_list_item.dart
+@@ -4,9 +4,11 @@
+ // SPDX-License-Identifier: AGPL-3.0-or-later
+ 
+ import 'package:fluffychat/config/app_config.dart';
++import 'package:fluffychat/config/setting_keys.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/pages/chat_list/unread_bubble.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/room_status_extension.dart';
+ import 'package:fluffychat/widgets/adaptive_dialogs/show_ok_cancel_alert_dialog.dart';
+ import 'package:fluffychat/widgets/future_loading_dialog.dart';
+@@ -14,6 +16,7 @@ import 'package:fluffychat/widgets/hover_builder.dart';
+ import 'package:fluffychat/widgets/typing_animation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:matrix/matrix.dart';
++import 'package:swipe_to_action/swipe_to_action.dart';
+ 
+ import '../../config/themes.dart';
+ import '../../utils/date_time_extension.dart';
+@@ -41,6 +44,13 @@ class ChatListItem extends StatelessWidget {
+ 
+   @override
+   Widget build(BuildContext context) {
++    return ValueListenableBuilder<int>(
++      valueListenable: ContactBook.revision,
++      builder: (context, _, __) => _buildTile(context),
++    );
++  }
++
++  Widget _buildTile(BuildContext context) {
+     final theme = Theme.of(context);
+ 
+     final isMuted = room.pushRuleState != PushRuleState.notify;
+@@ -53,11 +63,14 @@ class ChatListItem extends StatelessWidget {
+     final backgroundColor = activeChat
+         ? theme.colorScheme.secondaryContainer
+         : null;
+-    final displayname = room.getLocalizedDisplayname(
++    final rawName = room.getLocalizedDisplayname(
+       MatrixLocals(L10n.of(context)),
+     );
++    final displayname = room.uiDisplayname(MatrixLocals(L10n.of(context)));
+     final filter = this.filter;
+-    if (filter != null && !displayname.toLowerCase().contains(filter)) {
++    if (filter != null &&
++        !displayname.toLowerCase().contains(filter) &&
++        !rawName.toLowerCase().contains(filter)) {
+       return const SizedBox.shrink();
+     }
+ 
+@@ -66,7 +79,7 @@ class ChatListItem extends StatelessWidget {
+         room.getState(EventTypes.RoomMember, lastEvent.senderId) == null;
+     final space = this.space;
+ 
+-    return Padding(
++    final tile = Padding(
+       padding: const EdgeInsets.symmetric(horizontal: 8),
+       child: Material(
+         borderRadius: BorderRadius.circular(AppConfig.borderRadius),
+@@ -315,7 +328,7 @@ class ChatListItem extends StatelessWidget {
+                               '${lastEvent?.eventId}_${lastEvent?.type}_${lastEvent?.redacted}',
+                             ),
+                             future: needLastEventSender
+-                                ? lastEvent.calcLocalizedBody(
++                                ? lastEvent.uiLocalizedBody(
+                                     MatrixLocals(L10n.of(context)),
+                                     hideReply: true,
+                                     hideEdit: true,
+@@ -327,7 +340,7 @@ class ChatListItem extends StatelessWidget {
+                                             room.lastEvent?.senderId),
+                                   )
+                                 : null,
+-                            initialData: lastEvent?.calcLocalizedBodyFallback(
++                            initialData: lastEvent?.uiLocalizedBodyFallback(
+                               MatrixLocals(L10n.of(context)),
+                               hideReply: true,
+                               hideEdit: true,
+@@ -403,5 +416,38 @@ class ChatListItem extends StatelessWidget {
+         ),
+       ),
+     );
++
++    if (onForget != null) return tile;
++
++    return Swipeable(
++      key: ValueKey('swipe_read_${room.id}'),
++      direction: SwipeDirection.endToStart,
++      background: ColoredBox(
++        color: theme.colorScheme.primaryContainer,
++        child: Align(
++          alignment: Alignment.centerRight,
++          child: Padding(
++            padding: const EdgeInsets.only(right: 24),
++            child: Icon(
++              Icons.done_all_outlined,
++              color: theme.colorScheme.primary,
++            ),
++          ),
++        ),
++      ),
++      onSwipe: (_) async {
++        if (room.markedUnread) {
++          await room.markUnread(false);
++        }
++        final eventId = room.lastEvent?.eventId;
++        if (eventId == null || !eventId.isValidMatrixIdStrict()) return;
++        await room.setReadMarker(
++          eventId,
++          mRead: eventId,
++          public: AppSettings.sendPublicReadReceipts.value,
++        );
++      },
++      child: tile,
++    );
+   }
+ }
+diff --git a/lib/pages/chat_list/chat_list_view.dart b/lib/pages/chat_list/chat_list_view.dart
+index 0db2f7422..cdcd164d2 100644
+--- a/lib/pages/chat_list/chat_list_view.dart
++++ b/lib/pages/chat_list/chat_list_view.dart
+@@ -50,6 +50,7 @@ class ChatListView extends StatelessWidget {
+                       activeSpaceId: controller.activeSpaceId,
+                       onGoToChats: controller.clearActiveSpace,
+                       onGoToSpaceId: controller.setActiveSpace,
++                      onOrganizeSpaces: controller.organizeSpaces,
+                     )
+                   : SizedBox(
+                       width: 0,
+diff --git a/lib/pages/chat_list/navi_rail_item.dart b/lib/pages/chat_list/navi_rail_item.dart
+index 7ff17ad12..244d2bec8 100644
+--- a/lib/pages/chat_list/navi_rail_item.dart
++++ b/lib/pages/chat_list/navi_rail_item.dart
+@@ -5,6 +5,7 @@
+ 
+ import 'package:badges/badges.dart';
+ import 'package:fluffychat/config/app_config.dart';
++import 'package:fluffychat/utils/platform_infos.dart';
+ import 'package:fluffychat/widgets/hover_builder.dart';
+ import 'package:fluffychat/widgets/unread_rooms_badge.dart';
+ import 'package:flutter/material.dart';
+@@ -16,6 +17,7 @@ class NaviRailItem extends StatelessWidget {
+   final String toolTip;
+   final bool isSelected;
+   final void Function() onTap;
++  final void Function()? onLongPress;
+   final Widget icon;
+   final Widget? selectedIcon;
+   final bool Function(Room)? unreadBadgeFilter;
+@@ -24,6 +26,7 @@ class NaviRailItem extends StatelessWidget {
+     required this.toolTip,
+     required this.isSelected,
+     required this.onTap,
++    this.onLongPress,
+     required this.icon,
+     this.selectedIcon,
+     this.unreadBadgeFilter,
+@@ -74,11 +77,12 @@ class NaviRailItem extends StatelessWidget {
+                     color: isSelected
+                         ? theme.colorScheme.secondaryContainer
+                         : theme.colorScheme.surfaceContainerHighest,
+-                    child: Tooltip(
+-                      message: toolTip,
++                    child: _maybeTooltip(
++                      toolTip,
+                       child: InkWell(
+                         borderRadius: borderRadius,
+                         onTap: onTap,
++                        onLongPress: onLongPress,
+                         child: unreadBadgeFilter == null
+                             ? icon
+                             : UnreadRoomsBadge(
+@@ -100,4 +104,9 @@ class NaviRailItem extends StatelessWidget {
+       },
+     );
+   }
++
++  static Widget _maybeTooltip(String message, {required Widget child}) {
++    if (PlatformInfos.isLinux || message.isEmpty) return child;
++    return Tooltip(message: message, child: child);
++  }
+ }
+diff --git a/lib/pages/chat_list/navigation_rail.dart b/lib/pages/chat_list/navigation_rail.dart
+index a6491714e..5489fba76 100644
+--- a/lib/pages/chat_list/navigation_rail.dart
++++ b/lib/pages/chat_list/navigation_rail.dart
+@@ -6,7 +6,10 @@
+ import 'package:fluffychat/config/app_config.dart';
+ import 'package:fluffychat/config/themes.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
++import 'package:fluffychat/pages/chat_list/diagnostic_log_button.dart';
+ import 'package:fluffychat/pages/chat_list/navi_rail_item.dart';
++import 'package:fluffychat/utils/platform_infos.dart';
++import 'package:fluffychat/pages/chat_list/space_sidebar.dart';
+ import 'package:fluffychat/pages/chat_list/start_chat_fab.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
+ import 'package:fluffychat/utils/stream_extension.dart';
+@@ -20,11 +23,13 @@ class SpacesNavigationRail extends StatelessWidget {
+   final String? activeSpaceId;
+   final void Function() onGoToChats;
+   final void Function(String) onGoToSpaceId;
++  final VoidCallback? onOrganizeSpaces;
+ 
+   const SpacesNavigationRail({
+     required this.activeSpaceId,
+     required this.onGoToChats,
+     required this.onGoToSpaceId,
++    this.onOrganizeSpaces,
+     super.key,
+   });
+ 
+@@ -42,9 +47,9 @@ class SpacesNavigationRail extends StatelessWidget {
+               .where((s) => s.hasRoomUpdate)
+               .rateLimit(const Duration(seconds: 1)),
+           builder: (context, _) {
+-            final allSpaces = client.rooms
+-                .where((room) => room.isSpace)
+-                .toList();
++            final allSpaces = SpaceSidebar.visible(
++              client.rooms.where((room) => room.isSpace),
++            );
+ 
+             return SizedBox(
+               width: FluffyThemes.isColumnMode(context)
+@@ -62,6 +67,7 @@ class SpacesNavigationRail extends StatelessWidget {
+                           return NaviRailItem(
+                             isSelected: activeSpaceId == null,
+                             onTap: onGoToChats,
++                            onLongPress: onOrganizeSpaces,
+                             icon: const Padding(
+                               padding: EdgeInsets.all(12.0),
+                               child: Icon(Icons.forum_outlined),
+@@ -98,6 +104,7 @@ class SpacesNavigationRail extends StatelessWidget {
+                           toolTip: displayname,
+                           isSelected: activeSpaceId == space.id,
+                           onTap: () => onGoToSpaceId(allSpaces[i].id),
++                          onLongPress: onOrganizeSpaces,
+                           unreadBadgeFilter: (room) =>
+                               spaceChildrenIds.contains(room.id),
+                           icon: Avatar(
+@@ -126,6 +133,10 @@ class SpacesNavigationRail extends StatelessWidget {
+                       padding: const EdgeInsets.all(12.0),
+                       child: StartChatFab(),
+                     ),
++                  if (PlatformInfos.isLinux) ...const [
++                    NotifierRestartButton(),
++                    DiagnosticLogButton(),
++                  ],
+                 ],
+               ),
+             );
+diff --git a/lib/pages/chat_list/space_sidebar.dart b/lib/pages/chat_list/space_sidebar.dart
+new file mode 100644
+index 000000000..2f0e1263c
+--- /dev/null
++++ b/lib/pages/chat_list/space_sidebar.dart
+@@ -0,0 +1,324 @@
++// SPDX-FileCopyrightText: 2019-Present Contributors to FluffyChat
++//
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++import 'dart:convert';
++
++import 'package:fluffychat/config/app_config.dart';
++import 'package:fluffychat/config/setting_keys.dart';
++import 'package:fluffychat/l10n/l10n.dart';
++import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
++import 'package:fluffychat/utils/contact_book.dart';
++import 'package:fluffychat/widgets/avatar.dart';
++import 'package:fluffychat/widgets/matrix.dart';
++import 'package:flutter/material.dart';
++import 'package:matrix/matrix.dart';
++
++abstract class SpaceSidebar {
++  static const sortKey = 'chat.fluffy.sort_spaces_by_activity';
++  static const orderKey = 'chat.fluffy.space_sidebar_order';
++  static const hiddenKey = 'chat.fluffy.hidden_sidebar_spaces';
++
++  static bool get sortByActivity =>
++      AppSettings.store.getBool(sortKey) ?? true;
++
++  static Future<void> setSortByActivity(bool value) =>
++      AppSettings.store.setBool(sortKey, value);
++
++  static List<String> _ids(String key) {
++    final raw = AppSettings.store.getString(key);
++    if (raw == null || raw.isEmpty) return [];
++    try {
++      return List<String>.from(jsonDecode(raw));
++    } catch (_) {
++      return [];
++    }
++  }
++
++  static Future<void> _setIds(String key, List<String> ids) =>
++      AppSettings.store.setString(key, jsonEncode(ids));
++
++  static Set<String> get hiddenIds => _ids(hiddenKey).toSet();
++
++  static List<String> get orderIds => _ids(orderKey);
++
++  static List<Room> visible(Iterable<Room> all) {
++    final hidden = hiddenIds;
++    final order = orderIds;
++    final shown = all.where((s) => !hidden.contains(s.id)).toList();
++    if (order.isEmpty) return shown;
++    shown.sort((a, b) {
++      final ai = order.indexOf(a.id);
++      final bi = order.indexOf(b.id);
++      if (ai < 0 && bi < 0) return 0;
++      if (ai < 0) return 1;
++      if (bi < 0) return -1;
++      return ai.compareTo(bi);
++    });
++    return shown;
++  }
++
++  static Future<void> setHidden(Set<String> ids) =>
++      _setIds(hiddenKey, ids.toList());
++
++  static Future<void> setOrder(List<String> ids) => _setIds(orderKey, ids);
++}
++
++Future<void> showOrganizeSpacesSheet(
++  BuildContext context, {
++  VoidCallback? onChanged,
++}) {
++  return showModalBottomSheet<void>(
++    context: context,
++    isScrollControlled: true,
++    useRootNavigator: true,
++    clipBehavior: Clip.hardEdge,
++    constraints: BoxConstraints(
++      maxWidth: 512,
++      maxHeight: MediaQuery.sizeOf(context).height - 32,
++    ),
++    builder: (context) => SizedBox(
++      height: MediaQuery.sizeOf(context).height * 0.7,
++      child: _OrganizeSpacesSheet(onChanged: onChanged),
++    ),
++  );
++}
++
++/// Returns `''` to create a new group, a room ID to add, or `null` if cancelled.
++Future<String?> showAddChatToSpaceSheet(
++  BuildContext context, {
++  required Room space,
++}) {
++  return showModalBottomSheet<String>(
++    context: context,
++    isScrollControlled: true,
++    useRootNavigator: true,
++    clipBehavior: Clip.hardEdge,
++    constraints: BoxConstraints(
++      maxWidth: 512,
++      maxHeight: MediaQuery.sizeOf(context).height - 32,
++    ),
++    builder: (context) => SizedBox(
++      height: MediaQuery.sizeOf(context).height * 0.7,
++      child: _AddChatToSpaceSheet(space: space),
++    ),
++  );
++}
++
++class _OrganizeSpacesSheet extends StatefulWidget {
++  final VoidCallback? onChanged;
++  const _OrganizeSpacesSheet({this.onChanged});
++
++  @override
++  State<_OrganizeSpacesSheet> createState() => _OrganizeSpacesSheetState();
++}
++
++class _OrganizeSpacesSheetState extends State<_OrganizeSpacesSheet> {
++  List<Room> _spaces = [];
++  Set<String> _hidden = {};
++  bool _ready = false;
++
++  @override
++  void didChangeDependencies() {
++    super.didChangeDependencies();
++    if (_ready) return;
++    _ready = true;
++    final all = Matrix.of(context).client.rooms.where((r) => r.isSpace).toList();
++    final order = SpaceSidebar.orderIds;
++    if (order.isNotEmpty) {
++      all.sort((a, b) {
++        final ai = order.indexOf(a.id);
++        final bi = order.indexOf(b.id);
++        if (ai < 0 && bi < 0) return 0;
++        if (ai < 0) return 1;
++        if (bi < 0) return -1;
++        return ai.compareTo(bi);
++      });
++    }
++    _spaces = all;
++    _hidden = SpaceSidebar.hiddenIds;
++  }
++
++  Future<void> _save() async {
++    await SpaceSidebar.setOrder(_spaces.map((s) => s.id).toList());
++    await SpaceSidebar.setHidden(_hidden);
++    widget.onChanged?.call();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final l10n = L10n.of(context);
++    return Column(
++      children: [
++        ListTile(
++          title: Text(l10n.displayNavigationRail),
++          subtitle: const Text('Drag to reorder. Toggle to show on the sidebar.'),
++        ),
++        const Divider(height: 1),
++        Expanded(
++          child: ReorderableListView.builder(
++            buildDefaultDragHandles: false,
++            itemCount: _spaces.length,
++            onReorder: (oldIndex, newIndex) async {
++              if (newIndex > oldIndex) newIndex--;
++              final item = _spaces.removeAt(oldIndex);
++              _spaces.insert(newIndex, item);
++              setState(() {});
++              await _save();
++            },
++            itemBuilder: (context, i) {
++              final space = _spaces[i];
++              final name = space.getLocalizedDisplayname(
++                MatrixLocals(l10n),
++              );
++              return ListTile(
++                key: ValueKey(space.id),
++                leading: Avatar(
++                  mxContent: space.avatar,
++                  name: name,
++                  size: Avatar.defaultSize / 1.5,
++                  shapeBorder: RoundedSuperellipseBorder(
++                    side: BorderSide(
++                      width: 1,
++                      color: Theme.of(context).dividerColor,
++                    ),
++                    borderRadius: BorderRadius.circular(
++                      AppConfig.spaceBorderRadius,
++                    ),
++                  ),
++                  borderRadius: BorderRadius.circular(
++                    AppConfig.spaceBorderRadius,
++                  ),
++                ),
++                title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
++                trailing: Row(
++                  mainAxisSize: MainAxisSize.min,
++                  children: [
++                    Switch.adaptive(
++                      value: !_hidden.contains(space.id),
++                      onChanged: (show) async {
++                        if (show) {
++                          _hidden.remove(space.id);
++                        } else {
++                          _hidden.add(space.id);
++                        }
++                        setState(() {});
++                        await _save();
++                      },
++                    ),
++                    ReorderableDragStartListener(
++                      index: i,
++                      child: const Padding(
++                        padding: EdgeInsets.only(left: 8),
++                        child: Icon(Icons.drag_handle),
++                      ),
++                    ),
++                  ],
++                ),
++              );
++            },
++          ),
++        ),
++      ],
++    );
++  }
++}
++
++class _AddChatToSpaceSheet extends StatefulWidget {
++  final Room space;
++
++  const _AddChatToSpaceSheet({required this.space});
++
++  @override
++  State<_AddChatToSpaceSheet> createState() => _AddChatToSpaceSheetState();
++}
++
++class _AddChatToSpaceSheetState extends State<_AddChatToSpaceSheet> {
++  final TextEditingController _filterController = TextEditingController();
++
++  @override
++  void dispose() {
++    _filterController.dispose();
++    super.dispose();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final l10n = L10n.of(context);
++    final theme = Theme.of(context);
++    final client = Matrix.of(context).client;
++    final childIds = widget.space.spaceChildren.map((c) => c.roomId).toSet();
++    final filter = _filterController.text.trim().toLowerCase();
++    final rooms = client.rooms.where((room) {
++      if (room.id == widget.space.id) return false;
++      if (room.membership != Membership.join) return false;
++      if (childIds.contains(room.id)) return false;
++      if (filter.isEmpty) return true;
++      final raw = room.getLocalizedDisplayname(MatrixLocals(l10n)).toLowerCase();
++      final name = room.uiDisplayname(MatrixLocals(l10n)).toLowerCase();
++      return name.contains(filter) ||
++          raw.contains(filter) ||
++          room.id.toLowerCase().contains(filter) ||
++          room.canonicalAlias.toLowerCase().contains(filter);
++    }).toList();
++
++    return Column(
++      children: [
++        ListTile(title: Text(l10n.addChatOrSubSpace)),
++        Padding(
++          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
++          child: TextField(
++            controller: _filterController,
++            autofocus: true,
++            textInputAction: TextInputAction.search,
++            onChanged: (_) => setState(() {}),
++            decoration: InputDecoration(
++              filled: true,
++              fillColor: theme.colorScheme.secondaryContainer,
++              border: OutlineInputBorder(
++                borderSide: BorderSide.none,
++                borderRadius: BorderRadius.circular(99),
++              ),
++              hintText: l10n.search,
++              prefixIcon: const Icon(Icons.search_outlined),
++              suffixIcon: filter.isEmpty
++                  ? null
++                  : IconButton(
++                      tooltip: l10n.cancel,
++                      icon: const Icon(Icons.close_outlined),
++                      onPressed: () {
++                        _filterController.clear();
++                        setState(() {});
++                      },
++                    ),
++            ),
++          ),
++        ),
++        const Divider(height: 1),
++        ListTile(
++          leading: const Icon(Icons.add),
++          title: Text(l10n.createGroup),
++          onTap: () => Navigator.of(context).pop(''),
++        ),
++        Expanded(
++          child: ListView.builder(
++            itemCount: rooms.length,
++            itemBuilder: (context, i) {
++              final room = rooms[i];
++              final name = room.uiDisplayname(MatrixLocals(l10n));
++              return ListTile(
++                leading: Avatar(mxContent: room.avatar, name: name),
++                title: Text(
++                  name,
++                  maxLines: 1,
++                  overflow: TextOverflow.ellipsis,
++                ),
++                onTap: () => Navigator.of(context).pop(room.id),
++              );
++            },
++          ),
++        ),
++      ],
++    );
++  }
++}
+diff --git a/lib/pages/chat_list/space_view.dart b/lib/pages/chat_list/space_view.dart
+index 558056ea8..a228d178d 100644
+--- a/lib/pages/chat_list/space_view.dart
++++ b/lib/pages/chat_list/space_view.dart
+@@ -8,22 +8,27 @@ import 'dart:convert';
+ 
+ import 'package:collection/collection.dart';
+ import 'package:fluffychat/config/app_config.dart';
++import 'package:fluffychat/config/setting_keys.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/pages/chat_list/unread_bubble.dart';
++import 'package:fluffychat/pages/chat_list/space_sidebar.dart';
+ import 'package:fluffychat/utils/localized_exception_extension.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/stream_extension.dart';
+ import 'package:fluffychat/utils/string_color.dart';
++import 'package:fluffychat/widgets/adaptive_dialogs/show_modal_action_popup.dart';
+ import 'package:fluffychat/widgets/adaptive_dialogs/show_ok_cancel_alert_dialog.dart';
+ import 'package:fluffychat/widgets/avatar.dart';
+ import 'package:fluffychat/widgets/future_loading_dialog.dart';
+-import 'package:fluffychat/widgets/hover_builder.dart';
+ import 'package:fluffychat/widgets/matrix.dart';
+ import 'package:flutter/material.dart';
+ import 'package:go_router/go_router.dart';
+ import 'package:matrix/matrix.dart' as sdk;
+ import 'package:matrix/matrix.dart';
++import 'package:swipe_to_action/swipe_to_action.dart';
+ 
+ enum SpaceChildAction {
++  details,
+   mute,
+   unmute,
+   markAsUnread,
+@@ -32,19 +37,21 @@ enum SpaceChildAction {
+   leave,
+ }
+ 
+-enum SpaceActions { addChild, settings, leave }
++enum SpaceActions { addChild, settings, leave, sortByActivity, sidebar }
+ 
+ class SpaceView extends StatefulWidget {
+   final String spaceId;
+   final void Function() onBack;
+   final void Function(Room room) onChatTab;
+   final String? activeChat;
++  final VoidCallback? onSidebarChanged;
+ 
+   const SpaceView({
+     required this.spaceId,
+     required this.onBack,
+     required this.onChatTab,
+     required this.activeChat,
++    this.onSidebarChanged,
+     super.key,
+   });
+ 
+@@ -73,11 +80,17 @@ class _SpaceViewState extends State<SpaceView> {
+               false,
+         )
+         .listen(_loadHierarchy);
++    ContactBook.revision.addListener(_onContacts);
+     super.initState();
+   }
+ 
++  void _onContacts() {
++    if (mounted) setState(() {});
++  }
++
+   @override
+   void dispose() {
++    ContactBook.revision.removeListener(_onContacts);
+     _childStateSub?.cancel();
+     _filterController.dispose();
+     super.dispose();
+@@ -179,7 +192,32 @@ class _SpaceViewState extends State<SpaceView> {
+         context.push('/rooms/${widget.spaceId}/details');
+         break;
+       case SpaceActions.addChild:
+-        context.go('/rooms/newgroup?space_id=${widget.spaceId}');
++        if (space == null) return;
++        final picked = await showAddChatToSpaceSheet(context, space: space);
++        if (!mounted) return;
++        if (picked == null) return;
++        if (picked.isEmpty) {
++          context.go('/rooms/newgroup?space_id=${widget.spaceId}');
++          return;
++        }
++        final result = await showFutureLoadingDialog(
++          context: context,
++          future: () => space.setSpaceChild(picked),
++        );
++        if (result.isError || !mounted) return;
++        _nextBatch = null;
++        await _loadHierarchy();
++        break;
++      case SpaceActions.sortByActivity:
++        await SpaceSidebar.setSortByActivity(!SpaceSidebar.sortByActivity);
++        if (!mounted) return;
++        setState(() {});
++        break;
++      case SpaceActions.sidebar:
++        await showOrganizeSpacesSheet(
++          context,
++          onChanged: widget.onSidebarChanged,
++        );
+         break;
+       case SpaceActions.leave:
+         final confirmed = await showOkCancelAlertDialog(
+@@ -203,122 +241,116 @@ class _SpaceViewState extends State<SpaceView> {
+     }
+   }
+ 
+-  Future<void> _showSpaceChildEditMenu(
+-    BuildContext posContext,
+-    String roomId,
+-  ) async {
++  Future<void> _showSpaceActionsMenu() async {
++    final l10n = L10n.of(context);
++    final space = Matrix.of(context).client.getRoomById(widget.spaceId);
++    final isAdmin = space?.canChangeStateEvent(EventTypes.SpaceChild) == true;
++    final action = await showModalActionPopup<SpaceActions>(
++      context: context,
++      cancelLabel: l10n.cancel,
++      actions: [
++        if (isAdmin)
++          AdaptiveModalAction(
++            value: SpaceActions.addChild,
++            label: l10n.addChatOrSubSpace,
++            icon: const Icon(Icons.edit_square),
++          ),
++        AdaptiveModalAction(
++          value: SpaceActions.sortByActivity,
++          label: 'Most recent first',
++          icon: Icon(
++            SpaceSidebar.sortByActivity
++                ? Icons.check_box_outlined
++                : Icons.check_box_outline_blank,
++          ),
++        ),
++        AdaptiveModalAction(
++          value: SpaceActions.sidebar,
++          label: l10n.displayNavigationRail,
++          icon: const Icon(Icons.view_sidebar_outlined),
++        ),
++        AdaptiveModalAction(
++          value: SpaceActions.settings,
++          label: l10n.settings,
++          icon: const Icon(Icons.settings_outlined),
++        ),
++        AdaptiveModalAction(
++          value: SpaceActions.leave,
++          label: l10n.leave,
++          icon: const Icon(Icons.delete_outlined),
++          isDestructive: true,
++        ),
++      ],
++    );
++    if (action == null || !mounted) return;
++    await _onSpaceAction(action);
++  }
++
++  Future<void> _showSpaceChildEditMenu(String roomId) async {
+     final client = Matrix.of(context).client;
+     final space = client.getRoomById(widget.spaceId);
+     final room = client.getRoomById(roomId);
+     if (space == null) return;
+-    final overlay =
+-        Overlay.of(posContext).context.findRenderObject() as RenderBox;
+-
+-    final button = posContext.findRenderObject() as RenderBox;
+-
+-    final position = RelativeRect.fromRect(
+-      Rect.fromPoints(
+-        button.localToGlobal(const Offset(0, -65), ancestor: overlay),
+-        button.localToGlobal(
+-          button.size.bottomRight(Offset.zero) + const Offset(-50, 0),
+-          ancestor: overlay,
++    final l10n = L10n.of(context);
++    final actions = <AdaptiveModalAction<SpaceChildAction>>[
++      if (room != null && room.membership == Membership.join) ...[
++        AdaptiveModalAction(
++          value: SpaceChildAction.details,
++          label: room.isSpace ? l10n.settings : l10n.chatDetails,
++          icon: const Icon(Icons.info_outline_rounded),
+         ),
+-      ),
+-      Offset.zero & overlay.size,
+-    );
+-
+-    final action = await showMenu<SpaceChildAction>(
+-      context: posContext,
+-      position: position,
+-      items: [
+-        if (room != null && room.membership == Membership.join) ...[
+-          PopupMenuItem(
+-            value: room.pushRuleState == PushRuleState.notify
+-                ? SpaceChildAction.mute
+-                : SpaceChildAction.unmute,
+-            child: Row(
+-              mainAxisSize: .min,
+-              children: [
+-                Icon(
+-                  room.pushRuleState == PushRuleState.notify
+-                      ? Icons.notifications_off_outlined
+-                      : Icons.notifications_on_outlined,
+-                ),
+-                const SizedBox(width: 12),
+-                Text(
+-                  room.pushRuleState == PushRuleState.notify
+-                      ? L10n.of(context).muteChat
+-                      : L10n.of(context).unmuteChat,
+-                ),
+-              ],
+-            ),
+-          ),
+-          PopupMenuItem(
+-            value: room.markedUnread
+-                ? SpaceChildAction.markAsRead
+-                : SpaceChildAction.markAsUnread,
+-            child: Row(
+-              mainAxisSize: .min,
+-              children: [
+-                Icon(
+-                  room.markedUnread
+-                      ? Icons.mark_as_unread
+-                      : Icons.mark_as_unread_outlined,
+-                ),
+-                const SizedBox(width: 12),
+-                Text(
+-                  room.isUnread
+-                      ? L10n.of(context).markAsRead
+-                      : L10n.of(context).markAsUnread,
+-                ),
+-              ],
+-            ),
++        AdaptiveModalAction(
++          value: room.pushRuleState == PushRuleState.notify
++              ? SpaceChildAction.mute
++              : SpaceChildAction.unmute,
++          label: room.pushRuleState == PushRuleState.notify
++              ? l10n.muteChat
++              : l10n.unmuteChat,
++          icon: Icon(
++            room.pushRuleState == PushRuleState.notify
++                ? Icons.notifications_off_outlined
++                : Icons.notifications_on_outlined,
+           ),
+-          PopupMenuItem(
+-            value: SpaceChildAction.leave,
+-            child: Row(
+-              mainAxisSize: .min,
+-              children: [
+-                Icon(
+-                  Icons.delete_outlined,
+-                  color: Theme.of(context).colorScheme.onErrorContainer,
+-                ),
+-                const SizedBox(width: 12),
+-                Text(
+-                  L10n.of(context).leave,
+-                  style: TextStyle(
+-                    color: Theme.of(context).colorScheme.onErrorContainer,
+-                  ),
+-                ),
+-              ],
+-            ),
+-          ),
+-        ],
+-        if (space.canChangeStateEvent(EventTypes.SpaceChild) == true)
+-          PopupMenuItem(
+-            value: SpaceChildAction.removeFromSpace,
+-            child: Row(
+-              mainAxisSize: .min,
+-              children: [
+-                Icon(
+-                  Icons.remove,
+-                  color: Theme.of(context).colorScheme.onErrorContainer,
+-                ),
+-                const SizedBox(width: 12),
+-                Text(
+-                  L10n.of(context).removeFromSpace,
+-                  style: TextStyle(
+-                    color: Theme.of(context).colorScheme.onErrorContainer,
+-                  ),
+-                ),
+-              ],
+-            ),
++        ),
++        AdaptiveModalAction(
++          value: room.markedUnread
++              ? SpaceChildAction.markAsRead
++              : SpaceChildAction.markAsUnread,
++          label: room.isUnread ? l10n.markAsRead : l10n.markAsUnread,
++          icon: Icon(
++            room.markedUnread
++                ? Icons.mark_as_unread
++                : Icons.mark_as_unread_outlined,
+           ),
++        ),
++        AdaptiveModalAction(
++          value: SpaceChildAction.leave,
++          label: l10n.leave,
++          icon: const Icon(Icons.delete_outlined),
++          isDestructive: true,
++        ),
+       ],
++      if (space.canChangeStateEvent(EventTypes.SpaceChild) == true)
++        AdaptiveModalAction(
++          value: SpaceChildAction.removeFromSpace,
++          label: l10n.removeFromSpace,
++          icon: const Icon(Icons.remove),
++          isDestructive: true,
++        ),
++    ];
++    if (actions.isEmpty) return;
++    final action = await showModalActionPopup<SpaceChildAction>(
++      context: context,
++      cancelLabel: l10n.cancel,
++      actions: actions,
+     );
+-    if (action == null) return;
+-    if (!mounted) return;
++    if (action == null || !mounted) return;
+     switch (action) {
++      case SpaceChildAction.details:
++        await room?.postLoad();
++        if (!mounted) return;
++        context.push('/rooms/$roomId/details');
++        return;
+       case SpaceChildAction.removeFromSpace:
+         final consent = await showOkCancelAlertDialog(
+           context: context,
+@@ -381,6 +413,50 @@ class _SpaceViewState extends State<SpaceView> {
+                   .rateLimit(const Duration(seconds: 1)),
+               builder: (context, snapshot) {
+                 final filter = _filterController.text.trim().toLowerCase();
++                // Hierarchy pages can omit rooms we already know from
++                // m.space.child. Include those so a chat with a space badge
++                // on All also appears when that space is opened.
++                final children = <SpaceRoomsChunk$2>[];
++                final seen = <String>{};
++                if (room.isSpace) {
++                  for (final child in room.spaceChildren) {
++                    final id = child.roomId;
++                    if (id == null || !seen.add(id)) continue;
++                    final joined = room.client.getRoomById(id);
++                    children.add(
++                      SpaceRoomsChunk$2(
++                        guestCanJoin: false,
++                        numJoinedMembers:
++                            joined?.summary.mJoinedMemberCount ?? 0,
++                        roomId: id,
++                        worldReadable: false,
++                        childrenState: const [],
++                        name: joined?.getLocalizedDisplayname(),
++                        avatarUrl: joined?.avatar,
++                        roomType:
++                            joined?.isSpace == true ? 'm.space' : null,
++                      ),
++                    );
++                  }
++                }
++                for (final item in _discoveredChildren) {
++                  if (seen.add(item.roomId)) children.add(item);
++                }
++                if (SpaceSidebar.sortByActivity) {
++                  children.sort((a, b) {
++                    final aRoom = room.client.getRoomById(a.roomId);
++                    final bRoom = room.client.getRoomById(b.roomId);
++                    final aJoined =
++                        aRoom != null && aRoom.membership == Membership.join;
++                    final bJoined =
++                        bRoom != null && bRoom.membership == Membership.join;
++                    if (aJoined != bJoined) return aJoined ? -1 : 1;
++                    if (!aJoined) return 0;
++                    return bRoom!.latestEventReceivedTime.compareTo(
++                      aRoom!.latestEventReceivedTime,
++                    );
++                  });
++                }
+                 return CustomScrollView(
+                   slivers: [
+                     SliverAppBar(
+@@ -408,13 +458,8 @@ class _SpaceViewState extends State<SpaceView> {
+                           ),
+                           floatingLabelBehavior: FloatingLabelBehavior.never,
+                           prefixIcon: IconButton(
+-                            onPressed: () {},
+-                            icon: Icon(
+-                              Icons.search_outlined,
+-                              color: theme.colorScheme.onPrimaryContainer,
+-                            ),
+-                          ),
+-                          suffixIcon: PopupMenuButton<SpaceActions>(
++                            onPressed: () =>
++                                _onSpaceAction(SpaceActions.settings),
+                             icon: Avatar(
+                               size: avatarSize,
+                               mxContent: room.avatar,
+@@ -432,42 +477,22 @@ class _SpaceViewState extends State<SpaceView> {
+                                 AppConfig.spaceBorderRadius,
+                               ),
+                             ),
+-                            useRootNavigator: true,
+-                            onSelected: _onSpaceAction,
+-                            itemBuilder: (context) => [
+-                              if (isAdmin)
+-                                PopupMenuItem(
+-                                  value: SpaceActions.addChild,
+-                                  child: ListTile(
+-                                    leading: Icon(Icons.edit_square),
+-                                    title: Text(
+-                                      L10n.of(context).addChatOrSubSpace,
+-                                    ),
+-                                  ),
+-                                ),
+-                              PopupMenuItem(
+-                                value: SpaceActions.settings,
+-                                child: ListTile(
+-                                  leading: Icon(Icons.settings_outlined),
+-                                  title: Text(L10n.of(context).settings),
+-                                ),
+-                              ),
+-                              PopupMenuItem(
+-                                value: SpaceActions.leave,
+-                                child: ListTile(
+-                                  leading: Icon(Icons.delete_outlined),
+-                                  title: Text(L10n.of(context).leave),
+-                                ),
+-                              ),
+-                            ],
++                          ),
++                          suffixIcon: GestureDetector(
++                            behavior: HitTestBehavior.opaque,
++                            onTap: _showSpaceActionsMenu,
++                            child: Icon(
++                              Icons.more_vert,
++                              color: theme.colorScheme.onPrimaryContainer,
++                            ),
+                           ),
+                         ),
+                       ),
+                     ),
+                     SliverList.builder(
+-                      itemCount: _discoveredChildren.length + 1,
++                      itemCount: children.length + 1,
+                       itemBuilder: (context, i) {
+-                        if (i == _discoveredChildren.length) {
++                        if (i == children.length) {
+                           if (_noMoreRooms) {
+                             return const SizedBox.shrink();
+                           }
+@@ -484,140 +509,175 @@ class _SpaceViewState extends State<SpaceView> {
+                             ),
+                           );
+                         }
+-                        final item = _discoveredChildren[i];
++                        final item = children[i];
+                         var joinedRoom = room.client.getRoomById(item.roomId);
+-                        final displayname =
++                        var displayname =
+                             item.name ??
+                             item.canonicalAlias ??
+                             joinedRoom?.getLocalizedDisplayname() ??
+                             L10n.of(context).emptyChat;
++                        displayname = ContactBook.resolve(
++                          displayname,
++                          mxid: joinedRoom?.directChatMatrixID,
++                        );
+                         final avatarUrl = item.avatarUrl ?? joinedRoom?.avatar;
+-                        if (!displayname.toLowerCase().contains(filter)) {
++                        if (!displayname.toLowerCase().contains(filter) &&
++                            !(item.name ?? '').toLowerCase().contains(filter)) {
+                           return const SizedBox.shrink();
+                         }
+                         if (joinedRoom?.membership == Membership.leave) {
+                           joinedRoom = null;
+                         }
+ 
++                        final showChildMenu =
++                            isAdmin || joinedRoom != null;
++                        final tile = Material(
++                          borderRadius: BorderRadius.circular(
++                            AppConfig.borderRadius,
++                          ),
++                          clipBehavior: Clip.hardEdge,
++                          color:
++                              joinedRoom != null &&
++                                  widget.activeChat == joinedRoom.id
++                              ? theme.colorScheme.secondaryContainer
++                              : Colors.transparent,
++                          child: ListTile(
++                            visualDensity: const VisualDensity(
++                              vertical: -0.5,
++                            ),
++                            contentPadding: const EdgeInsets.only(
++                              left: 8,
++                              right: 4,
++                            ),
++                            onTap: joinedRoom != null
++                                ? () => widget.onChatTab(joinedRoom!)
++                                : null,
++                            onLongPress: showChildMenu
++                                ? () => _showSpaceChildEditMenu(item.roomId)
++                                : null,
++                            leading: Avatar(
++                              size: avatarSize,
++                              mxContent: avatarUrl,
++                              name: '#',
++                              backgroundColor:
++                                  theme.colorScheme.surfaceContainer,
++                              textColor:
++                                  item.name?.colorScheme.primary ??
++                                  theme.colorScheme.onSurface,
++                              shapeBorder: item.roomType == 'm.space'
++                                  ? RoundedSuperellipseBorder(
++                                      side: BorderSide(
++                                        color: theme
++                                            .colorScheme
++                                            .surfaceContainerHighest,
++                                      ),
++                                      borderRadius: BorderRadius.circular(
++                                        AppConfig.borderRadius / 4,
++                                      ),
++                                    )
++                                  : null,
++                              borderRadius: item.roomType == 'm.space'
++                                  ? BorderRadius.circular(
++                                      AppConfig.borderRadius / 4,
++                                    )
++                                  : null,
++                            ),
++                            title: Row(
++                              children: [
++                                Expanded(
++                                  child: Opacity(
++                                    opacity: joinedRoom == null ? 0.5 : 1,
++                                    child: Text(
++                                      displayname,
++                                      maxLines: 1,
++                                      overflow: TextOverflow.ellipsis,
++                                    ),
++                                  ),
++                                ),
++                                if (joinedRoom != null &&
++                                    joinedRoom.pushRuleState !=
++                                        PushRuleState.notify)
++                                  const Padding(
++                                    padding: EdgeInsets.only(left: 4.0),
++                                    child: Icon(
++                                      Icons.notifications_off_outlined,
++                                      size: 16,
++                                    ),
++                                  ),
++                                if (joinedRoom != null)
++                                  UnreadBubble(room: joinedRoom)
++                                else
++                                  TextButton(
++                                    onPressed: () => _joinChildRoom(item),
++                                    child: Text(L10n.of(context).join),
++                                  ),
++                              ],
++                            ),
++                          ),
++                        );
++                        Widget body = joinedRoom == null
++                            ? tile
++                            : Swipeable(
++                                key: ValueKey('swipe_read_${joinedRoom.id}'),
++                                direction: SwipeDirection.endToStart,
++                                background: ColoredBox(
++                                  color: theme.colorScheme.primaryContainer,
++                                  child: Align(
++                                    alignment: Alignment.centerRight,
++                                    child: Padding(
++                                      padding: const EdgeInsets.only(
++                                        right: 24,
++                                      ),
++                                      child: Icon(
++                                        Icons.done_all_outlined,
++                                        color: theme.colorScheme.primary,
++                                      ),
++                                    ),
++                                  ),
++                                ),
++                                onSwipe: (_) async {
++                                  final room = joinedRoom!;
++                                  if (room.markedUnread) {
++                                    await room.markUnread(false);
++                                  }
++                                  final eventId = room.lastEvent?.eventId;
++                                  if (eventId == null ||
++                                      !eventId.isValidMatrixIdStrict()) {
++                                    return;
++                                  }
++                                  await room.setReadMarker(
++                                    eventId,
++                                    mRead: eventId,
++                                    public: AppSettings
++                                        .sendPublicReadReceipts
++                                        .value,
++                                  );
++                                },
++                                child: tile,
++                              );
+                         return Padding(
+                           padding: const EdgeInsets.symmetric(
+                             horizontal: 8,
+                             vertical: 1,
+                           ),
+-                          child: Material(
+-                            borderRadius: BorderRadius.circular(
+-                              AppConfig.borderRadius,
+-                            ),
+-                            clipBehavior: Clip.hardEdge,
+-                            color:
+-                                joinedRoom != null &&
+-                                    widget.activeChat == joinedRoom.id
+-                                ? theme.colorScheme.secondaryContainer
+-                                : Colors.transparent,
+-                            child: HoverBuilder(
+-                              builder: (context, hovered) => ListTile(
+-                                visualDensity: const VisualDensity(
+-                                  vertical: -0.5,
+-                                ),
+-                                contentPadding: EdgeInsets.only(
+-                                  left: 8,
+-                                  right: joinedRoom == null ? 0 : 8,
+-                                ),
+-                                onTap: joinedRoom != null
+-                                    ? () => widget.onChatTab(joinedRoom!)
+-                                    : null,
+-                                onLongPress: joinedRoom != null
+-                                    ? () => _showSpaceChildEditMenu(
+-                                        context,
++                          child: showChildMenu
++                              ? Row(
++                                  children: [
++                                    Expanded(child: body),
++                                    GestureDetector(
++                                      behavior: HitTestBehavior.opaque,
++                                      onTap: () => _showSpaceChildEditMenu(
+                                         item.roomId,
+-                                      )
+-                                    : null,
+-                                leading:
+-                                    hovered && (isAdmin || joinedRoom != null)
+-                                    ? SizedBox.square(
+-                                        dimension: avatarSize,
+-                                        child: IconButton(
+-                                          splashRadius: avatarSize,
+-                                          iconSize: 14,
+-                                          style: IconButton.styleFrom(
+-                                            foregroundColor: theme
+-                                                .colorScheme
+-                                                .onTertiaryContainer,
+-                                            backgroundColor: theme
+-                                                .colorScheme
+-                                                .tertiaryContainer,
+-                                          ),
+-                                          onPressed: () =>
+-                                              _showSpaceChildEditMenu(
+-                                                context,
+-                                                item.roomId,
+-                                              ),
+-                                          icon: const Icon(Icons.edit_outlined),
+-                                        ),
+-                                      )
+-                                    : Avatar(
+-                                        size: avatarSize,
+-                                        mxContent: avatarUrl,
+-                                        name: '#',
+-                                        backgroundColor:
+-                                            theme.colorScheme.surfaceContainer,
+-                                        textColor:
+-                                            item.name?.colorScheme.primary ??
+-                                            theme.colorScheme.onSurface,
+-                                        shapeBorder: item.roomType == 'm.space'
+-                                            ? RoundedSuperellipseBorder(
+-                                                side: BorderSide(
+-                                                  color: theme
+-                                                      .colorScheme
+-                                                      .surfaceContainerHighest,
+-                                                ),
+-                                                borderRadius:
+-                                                    BorderRadius.circular(
+-                                                      AppConfig.borderRadius /
+-                                                          4,
+-                                                    ),
+-                                              )
+-                                            : null,
+-                                        borderRadius: item.roomType == 'm.space'
+-                                            ? BorderRadius.circular(
+-                                                AppConfig.borderRadius / 4,
+-                                              )
+-                                            : null,
+                                       ),
+-                                title: Row(
+-                                  children: [
+-                                    Expanded(
+-                                      child: Opacity(
+-                                        opacity: joinedRoom == null ? 0.5 : 1,
+-                                        child: Text(
+-                                          displayname,
+-                                          maxLines: 1,
+-                                          overflow: TextOverflow.ellipsis,
+-                                        ),
++                                      child: const SizedBox(
++                                        width: 48,
++                                        height: 48,
++                                        child: Icon(Icons.more_vert),
+                                       ),
+                                     ),
+-                                    if (joinedRoom != null &&
+-                                        joinedRoom.pushRuleState !=
+-                                            PushRuleState.notify)
+-                                      const Padding(
+-                                        padding: EdgeInsets.only(left: 4.0),
+-                                        child: Icon(
+-                                          Icons.notifications_off_outlined,
+-                                          size: 16,
+-                                        ),
+-                                      ),
+-                                    if (joinedRoom != null)
+-                                      UnreadBubble(room: joinedRoom)
+-                                    else
+-                                      TextButton(
+-                                        onPressed: () => _joinChildRoom(item),
+-                                        child: Text(L10n.of(context).join),
+-                                      ),
+                                   ],
+-                                ),
+-                              ),
+-                            ),
+-                          ),
++                                )
++                              : body,
+                         );
+                       },
+                     ),
+diff --git a/lib/pages/settings_chat/settings_chat.dart b/lib/pages/settings_chat/settings_chat.dart
+index 198764eb6..88389f152 100644
+--- a/lib/pages/settings_chat/settings_chat.dart
++++ b/lib/pages/settings_chat/settings_chat.dart
+@@ -3,6 +3,8 @@
+ //
+ // SPDX-License-Identifier: AGPL-3.0-or-later
+ 
++import 'package:fluffychat/utils/contact_book.dart';
++import 'package:fluffychat/widgets/future_loading_dialog.dart';
+ import 'package:flutter/material.dart';
+ 
+ import 'settings_chat_view.dart';
+@@ -17,6 +19,27 @@ class SettingsChat extends StatefulWidget {
+ class SettingsChatController extends State<SettingsChat> {
+   void updateState() => setState(() {});
+ 
++  Future<void> refreshAddressBook() async {
++    final result = await showFutureLoadingDialog<int>(
++      context: context,
++      title: 'Reading address book…',
++      future: ContactBook.syncFromPhone,
++    );
++    if (!mounted) return;
++    updateState();
++    final n = result.result;
++    if (n == null) return;
++    ScaffoldMessenger.of(context).showSnackBar(
++      SnackBar(
++        content: Text(
++          n == 0
++              ? 'No contacts found in the address book.'
++              : 'Saved $n names from the address book.',
++        ),
++      ),
++    );
++  }
++
+   @override
+   Widget build(BuildContext context) => SettingsChatView(this);
+ }
+diff --git a/lib/pages/settings_chat/settings_chat_view.dart b/lib/pages/settings_chat/settings_chat_view.dart
+index cbd8b80c4..61c59bd03 100644
+--- a/lib/pages/settings_chat/settings_chat_view.dart
++++ b/lib/pages/settings_chat/settings_chat_view.dart
+@@ -8,6 +8,7 @@ import 'package:fluffychat/config/setting_keys.dart';
+ import 'package:fluffychat/config/themes.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/utils/adaptive_bottom_sheet.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/platform_infos.dart';
+ import 'package:fluffychat/widgets/layouts/max_width_body.dart';
+ import 'package:fluffychat/widgets/matrix.dart';
+@@ -135,6 +136,37 @@ class SettingsChatView extends StatelessWidget {
+                     }
+                   },
+                 ),
++              if (PlatformInfos.isLinux) ...[
++                Divider(color: theme.dividerColor),
++                ListTile(
++                  title: Text(
++                    'Address book',
++                    style: TextStyle(
++                      color: theme.colorScheme.secondary,
++                      fontWeight: FontWeight.bold,
++                    ),
++                  ),
++                ),
++                ValueListenableBuilder<int>(
++                  valueListenable: ContactBook.revision,
++                  builder: (context, _, __) {
++                    final n = ContactBook.people;
++                    final synced = ContactBook.lastSync;
++                    final subtitle = n == 0
++                        ? 'Names for numbered chats come from your phone book. Sync once, then FluffyChat keeps its own copy.'
++                        : synced == null
++                        ? '$n names saved'
++                        : '$n names saved · last sync ${synced.year}-${synced.month.toString().padLeft(2, '0')}-${synced.day.toString().padLeft(2, '0')}';
++                    return ListTile(
++                      leading: const Icon(Icons.contacts_outlined),
++                      title: const Text('Refresh from phone'),
++                      subtitle: Text(subtitle),
++                      trailing: const Icon(Icons.sync_outlined),
++                      onTap: controller.refreshAddressBook,
++                    );
++                  },
++                ),
++              ],
+               Divider(color: theme.dividerColor),
+               ListTile(
+                 title: Text(
+diff --git a/lib/utils/contact_book.dart b/lib/utils/contact_book.dart
+new file mode 100644
+index 000000000..ac65acf57
+--- /dev/null
++++ b/lib/utils/contact_book.dart
+@@ -0,0 +1,456 @@
++// SPDX-FileCopyrightText: 2019-Present Contributors to FluffyChat
++//
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++import 'dart:async';
++import 'dart:convert';
++import 'dart:io';
++
++import 'package:fluffychat/config/setting_keys.dart';
++import 'package:fluffychat/utils/platform_infos.dart';
++import 'package:flutter/foundation.dart';
++import 'package:matrix/matrix.dart';
++import 'package:ut_media/ut_media.dart';
++
++/// FluffyChat's own phone-number → name book.
++///
++/// Chat lists only look up this in-memory map. The Ubuntu Touch address
++/// book is read when the user taps Refresh in Chat settings, then the
++/// compact list is stored in SharedPreferences.
++///
++/// WhatsApp LID ghosts have no phone digits. Their previous display name
++/// (or a name the user assigns) is stored in [overlays] keyed by MXID.
++///
++/// When the bridge replaces a real WhatsApp name with a bare number, the
++/// last real name is kept in [remembered] and shown if no contact matches.
++///
++/// The background push helper cannot reach SharedPreferences, so every
++/// change is also exported to `contact_names.json` in the app cache dir.
++class ContactBook {
++  ContactBook._();
++
++  static const storeKey = 'chat.fluffy.contact_book';
++  static const exportFileName = 'contact_names.json';
++  static final ValueNotifier<int> revision = ValueNotifier(0);
++
++  static final Map<String, String> _names = {};
++  static final Map<String, String> _overlays = {};
++  static final Map<String, String> _remembered = {};
++  static final Map<String, String> _resolved = {};
++  static int _people = 0;
++  static DateTime? _lastSync;
++  static int _harvestPass = 0;
++  static bool _persistScheduled = false;
++
++  static int get people => _people;
++  static DateTime? get lastSync => _lastSync;
++
++  static final _nonDigit = RegExp(r'\D');
++  static final _leadingZeros = RegExp(r'^0+');
++  static final _bridgeTag = RegExp(r'\s*\((WA|Signal|Telegram|SMS)\)$');
++  static final _letter = RegExp(r'[^\W\d_]', unicode: true);
++  static const _bridgePrefixes = [
++    'whatsapp_',
++    'signal_',
++    'telegram_',
++    'sms_',
++  ];
++
++  /// Load the cached book from disk. Does not talk to the phone address book.
++  static void load() {
++    if (!PlatformInfos.isLinux) return;
++    final raw = AppSettings.store.getString(storeKey);
++    if (raw == null || raw.isEmpty) return;
++    try {
++      final decoded = jsonDecode(raw);
++      if (decoded is! Map) return;
++      final rows = decoded['contacts'];
++      if (rows is List) {
++        _applyRows(rows);
++      }
++      _loadOverlays(decoded['overlays']);
++      _loadMap(_remembered, decoded['remembered']);
++      final synced = decoded['synced'];
++      if (synced is int) {
++        _lastSync = DateTime.fromMillisecondsSinceEpoch(synced);
++      }
++      revision.value++;
++      _export();
++    } catch (_) {}
++  }
++
++  /// Copy names and numbers from the phone address book into FluffyChat.
++  static Future<int> syncFromPhone() async {
++    if (!PlatformInfos.isLinux) return 0;
++    final rows = await UtMedia.listContacts();
++    if (rows.isEmpty) {
++      throw Exception('Address book returned no contacts.');
++    }
++    _applyRows(rows);
++    if (_people == 0) {
++      throw Exception('Address book contacts had no phone numbers.');
++    }
++    _lastSync = DateTime.now();
++    _harvestPass = 0;
++    await _persist(contacts: _compact(rows));
++    revision.value++;
++    return _people;
++  }
++
++  /// Walk already-loaded room members for previous `+phone (WA)` labels
++  /// and remember MXID → contact name. In-memory only; no address-book I/O.
++  static void learnFromClient(Client client) {
++    if (!PlatformInfos.isLinux) return;
++    if (_names.isEmpty || client.rooms.isEmpty) return;
++    if (_harvestPass >= 2) return;
++    _harvestPass++;
++    var learned = false;
++    for (final room in client.rooms) {
++      for (final user in room.getParticipants()) {
++        if (_overlays.containsKey(user.id)) continue;
++        final hint = user.prevContent?.tryGet<String>('displayname');
++        if (hint == null || hint.isEmpty) continue;
++        final name = _lookup(hint);
++        if (name != null) {
++          _overlays[user.id] = name;
++          learned = true;
++          continue;
++        }
++        final current = user.displayName ?? '';
++        if (_looksLikePhone(current) && _isRealName(hint)) {
++          final real = _stripBridgeTag(hint);
++          if (_remembered[user.id] != real) {
++            _remembered[user.id] = real;
++            learned = true;
++          }
++        }
++      }
++    }
++    if (learned) {
++      _resolved.clear();
++      revision.value++;
++      _schedulePersist();
++    }
++  }
++
++  static String? localName(String mxid) => _overlays[mxid];
++
++  /// Persist a local MXID → name overlay. Empty [name] clears it.
++  static Future<void> assignName(String mxid, String name) async {
++    if (!PlatformInfos.isLinux) return;
++    final trimmed = name.trim();
++    if (trimmed.isEmpty) {
++      _overlays.remove(mxid);
++    } else {
++      _overlays[mxid] = _canonicalName(trimmed) ?? trimmed;
++    }
++    _resolved.clear();
++    await _persist();
++    revision.value++;
++  }
++
++  static String resolve(String display, {String? mxid, String? hint}) {
++    final id = mxid ?? display;
++    final overlay = mxid == null ? null : _overlays[mxid];
++    if (overlay != null) return overlay;
++
++    if (_names.isEmpty) return display;
++
++    final cached = _resolved[id];
++    if (cached != null) return cached;
++
++    String? found;
++    if (hint != null && hint.isNotEmpty) {
++      found = _lookup(hint);
++    }
++    if (found == null && _looksLikePhone(display)) {
++      found = _lookup(display);
++    }
++    found ??= _lookup(mxid);
++
++    if (found != null && mxid != null && _isLid(mxid) && hint != null) {
++      _overlays.putIfAbsent(mxid, () => found!);
++      _schedulePersist();
++    }
++
++    if (found == null && _looksLikePhone(display)) {
++      found = mxid == null ? null : _remembered[mxid];
++      if (found == null && hint != null && _isRealName(hint)) {
++        found = _stripBridgeTag(hint);
++        if (mxid != null) {
++          _remembered[mxid] = found;
++          _schedulePersist();
++        }
++      }
++    }
++
++    final result = found ?? display;
++    _resolved[id] = result;
++    return result;
++  }
++
++  static void _applyRows(List<dynamic> rows) {
++    _names.clear();
++    _resolved.clear();
++    var people = 0;
++    for (final row in rows) {
++      if (row is! Map) continue;
++      final name = (row['name'] ?? row['n']) as String?;
++      final phones = row['phones'] ?? row['p'];
++      if (name == null || name.isEmpty || phones is! List) continue;
++      var used = false;
++      for (final phone in phones) {
++        if (phone is! String) continue;
++        for (final key in _keys(phone)) {
++          _names.putIfAbsent(key, () => name);
++          used = true;
++        }
++      }
++      if (used) people++;
++    }
++    _people = people;
++  }
++
++  static void _loadOverlays(dynamic raw) => _loadMap(_overlays, raw);
++
++  static void _loadMap(Map<String, String> target, dynamic raw) {
++    target.clear();
++    if (raw is! Map) return;
++    raw.forEach((key, value) {
++      if (key is String &&
++          value is String &&
++          key.isNotEmpty &&
++          value.isNotEmpty) {
++        target[key] = value;
++      }
++    });
++  }
++
++  static List<Map<String, Object>> _compact(List<dynamic> rows) {
++    final compact = <Map<String, Object>>[];
++    for (final row in rows) {
++      if (row is! Map) continue;
++      final name = row['name'] as String?;
++      final phones = row['phones'];
++      if (name == null || name.isEmpty || phones is! List) continue;
++      final kept = phones.whereType<String>().where((p) => p.isNotEmpty);
++      if (kept.isEmpty) continue;
++      compact.add({'n': name, 'p': kept.toList()});
++    }
++    return compact;
++  }
++
++  static String? _canonicalName(String input) {
++    final lower = input.toLowerCase();
++    for (final name in _names.values) {
++      if (name.toLowerCase() == lower) return name;
++    }
++    return null;
++  }
++
++  static Future<void> _persist({List<Map<String, Object>>? contacts}) async {
++    final raw = AppSettings.store.getString(storeKey);
++    Map<String, dynamic> decoded = {};
++    if (raw != null && raw.isNotEmpty) {
++      try {
++        final value = jsonDecode(raw);
++        if (value is Map) {
++          decoded = Map<String, dynamic>.from(value);
++        }
++      } catch (_) {}
++    }
++    if (contacts != null) {
++      decoded['contacts'] = contacts;
++      if (_lastSync != null) {
++        decoded['synced'] = _lastSync!.millisecondsSinceEpoch;
++      }
++    }
++    if (_overlays.isEmpty) {
++      decoded.remove('overlays');
++    } else {
++      decoded['overlays'] = _overlays;
++    }
++    if (_remembered.isEmpty) {
++      decoded.remove('remembered');
++    } else {
++      decoded['remembered'] = _remembered;
++    }
++    await AppSettings.store.setString(storeKey, jsonEncode(decoded));
++    _export();
++  }
++
++  /// Number keys → name plus per-MXID names, for `push/push.cpp`. Keys
++  /// already include the suffix variants from [_keys], so the helper only
++  /// has to compute the same variants for the sender.
++  static void _export() {
++    final payload = jsonEncode({
++      'numbers': _names,
++      'users': _overlays,
++      'remembered': _remembered,
++    });
++    final dir = Directory(_cacheDir());
++    unawaited(() async {
++      try {
++        await dir.create(recursive: true);
++        final tmp = File('${dir.path}/$exportFileName.tmp');
++        await tmp.writeAsString(payload, flush: true);
++        await tmp.rename('${dir.path}/$exportFileName');
++      } catch (e) {
++        Logs().w('ContactBook: cannot export names for the push helper', e);
++      }
++    }());
++  }
++
++  static String _cacheDir() {
++    final xdg = Platform.environment['XDG_CACHE_HOME'];
++    if (xdg != null && xdg.isNotEmpty) {
++      return xdg.endsWith('fluffychat.notkit')
++          ? xdg
++          : '$xdg/fluffychat.notkit';
++    }
++    final home = Platform.environment['HOME'] ?? '/home/phablet';
++    return '$home/.cache/fluffychat.notkit';
++  }
++
++  static bool _isRealName(String value) {
++    final name = _stripBridgeTag(value);
++    return name.isNotEmpty &&
++        !_looksLikePhone(name) &&
++        !_isLid(name) &&
++        _letter.hasMatch(name);
++  }
++
++  static String _stripBridgeTag(String value) =>
++      value.replaceFirst(_bridgeTag, '').trim();
++
++  static void _schedulePersist() {
++    if (_persistScheduled) return;
++    _persistScheduled = true;
++    Future.microtask(() async {
++      _persistScheduled = false;
++      await _persist();
++    });
++  }
++
++  static bool _isLid(String value) {
++    final lower = value.toLowerCase();
++    return lower.contains('whatsapp_lid') || lower.contains('_lid-');
++  }
++
++  static bool _looksLikePhone(String value) {
++    final trimmed = value.trim();
++    if (trimmed.isEmpty || _isLid(trimmed)) return false;
++    final digits = trimmed.replaceAll(_nonDigit, '');
++    // Bridge labels like "+265881522266 (WA)" still count as numbers.
++    if (digits.length >= 7) return true;
++    final lower = trimmed.toLowerCase();
++    for (final prefix in _bridgePrefixes) {
++      if (lower.contains(prefix)) return true;
++    }
++    return false;
++  }
++
++  static String? _lookup(String? value) {
++    if (value == null || value.isEmpty) return null;
++    for (final key in _keys(value)) {
++      final name = _names[key];
++      if (name != null) return name;
++    }
++    return null;
++  }
++
++  static Iterable<String> _keys(String raw) sync* {
++    var text = raw.toLowerCase();
++    final at = text.indexOf(':');
++    if (text.startsWith('@') && at > 0) {
++      text = text.substring(1, at);
++    }
++    for (final prefix in _bridgePrefixes) {
++      if (text.startsWith(prefix)) {
++        text = text.substring(prefix.length);
++        break;
++      }
++    }
++    // WhatsApp LID ghost ids are not phone numbers.
++    if (text.startsWith('lid')) return;
++    final digits = text.replaceAll(_nonDigit, '');
++    if (digits.length < 7) return;
++    yield digits;
++    final stripped = digits.replaceFirst(_leadingZeros, '');
++    if (stripped.length >= 7 && stripped != digits) yield stripped;
++    if (digits.length > 10) yield digits.substring(digits.length - 10);
++    if (digits.length > 9) yield digits.substring(digits.length - 9);
++    if (digits.length > 8) yield digits.substring(digits.length - 8);
++    if (stripped.length > 9) yield stripped.substring(stripped.length - 9);
++    if (stripped.length > 8) yield stripped.substring(stripped.length - 8);
++  }
++}
++
++extension ContactRoomName on Room {
++  String uiDisplayname([MatrixLocalizations? i18n]) {
++    final raw = i18n == null
++        ? getLocalizedDisplayname()
++        : getLocalizedDisplayname(i18n);
++    return ContactBook.resolve(raw, mxid: directChatMatrixID);
++  }
++}
++
++extension ContactUserName on User {
++  String uiDisplayname() => ContactBook.resolve(
++    calcDisplayname(),
++    mxid: id,
++    hint: prevContent?.tryGet<String>('displayname'),
++  );
++}
++
++/// The SDK builds previews and notification text with the bridge's sender
++/// name ("+1555… (WA): hi", "+1555… sent a picture"). Swap in the
++/// ContactBook name for the first occurrence.
++extension ContactEventBody on Event {
++  Future<String> uiLocalizedBody(
++    MatrixLocalizations i18n, {
++    bool withSenderNamePrefix = false,
++    bool hideReply = false,
++    bool hideEdit = false,
++    bool plaintextBody = false,
++    bool removeMarkdown = false,
++  }) async {
++    final body = await calcLocalizedBody(
++      i18n,
++      withSenderNamePrefix: withSenderNamePrefix,
++      hideReply: hideReply,
++      hideEdit: hideEdit,
++      plaintextBody: plaintextBody,
++      removeMarkdown: removeMarkdown,
++    );
++    return _withContactSender(body, i18n);
++  }
++
++  String uiLocalizedBodyFallback(
++    MatrixLocalizations i18n, {
++    bool withSenderNamePrefix = false,
++    bool hideReply = false,
++    bool hideEdit = false,
++    bool plaintextBody = false,
++    bool removeMarkdown = false,
++  }) => _withContactSender(
++    calcLocalizedBodyFallback(
++      i18n,
++      withSenderNamePrefix: withSenderNamePrefix,
++      hideReply: hideReply,
++      hideEdit: hideEdit,
++      plaintextBody: plaintextBody,
++      removeMarkdown: removeMarkdown,
++    ),
++    i18n,
++  );
++
++  String _withContactSender(String body, MatrixLocalizations i18n) {
++    if (senderId == room.client.userID) return body;
++    final sender = senderFromMemoryOrFallback;
++    final raw = sender.calcDisplayname(i18n: i18n);
++    final shown = sender.uiDisplayname();
++    if (raw.isEmpty || raw == shown) return body;
++    return body.replaceFirst(raw, shown);
++  }
++}
 diff --git a/lib/utils/platform_infos.dart b/lib/utils/platform_infos.dart
 index f331edc16..cf6bd5f2a 100644
 --- a/lib/utils/platform_infos.dart
@@ -269,6 +2833,39 @@ index f331edc16..cf6bd5f2a 100644
  
    static bool get supportsAppLock => (isMobile || isMacOS);
  
+diff --git a/lib/utils/room_status_extension.dart b/lib/utils/room_status_extension.dart
+index d7eeb116d..852bdd32e 100644
+--- a/lib/utils/room_status_extension.dart
++++ b/lib/utils/room_status_extension.dart
+@@ -8,6 +8,7 @@ import 'package:flutter/widgets.dart';
+ import 'package:matrix/matrix.dart';
+ 
+ import '../config/app_config.dart';
++import 'contact_book.dart';
+ 
+ extension RoomStatusExtension on Room {
+   String getLocalizedTypingText(BuildContext context) {
+@@ -25,16 +26,16 @@ extension RoomStatusExtension on Room {
+       if (typingUsers.first.id != directChatMatrixID) {
+         typingText = L10n.of(
+           context,
+-        ).userIsTyping(typingUsers.first.calcDisplayname());
++        ).userIsTyping(typingUsers.first.uiDisplayname());
+       }
+     } else if (typingUsers.length == 2) {
+       typingText = L10n.of(context).userAndUserAreTyping(
+-        typingUsers.first.calcDisplayname(),
+-        typingUsers[1].calcDisplayname(),
++        typingUsers.first.uiDisplayname(),
++        typingUsers[1].uiDisplayname(),
+       );
+     } else if (typingUsers.length > 2) {
+       typingText = L10n.of(context).userAndOthersAreTyping(
+-        typingUsers.first.calcDisplayname(),
++        typingUsers.first.uiDisplayname(),
+         (typingUsers.length - 1),
+       );
+     }
 diff --git a/lib/widgets/bottom_back_gesture.dart b/lib/widgets/bottom_back_gesture.dart
 new file mode 100644
 index 000000000..f0c5e977a
@@ -373,43 +2970,78 @@ index 000000000..f0c5e977a
 +  }
 +}
 diff --git a/lib/widgets/fluffy_chat_app.dart b/lib/widgets/fluffy_chat_app.dart
-index 2e2d7b029..0b9e705f9 100644
+index 2e2d7b029..9c8641ac5 100644
 --- a/lib/widgets/fluffy_chat_app.dart
 +++ b/lib/widgets/fluffy_chat_app.dart
-@@ -9,6 +9,7 @@ import 'package:fluffychat/config/setting_keys.dart';
+@@ -8,7 +8,9 @@ import 'package:fluffychat/config/routes.dart';
+ import 'package:fluffychat/config/setting_keys.dart';
  import 'package:fluffychat/config/themes.dart';
  import 'package:fluffychat/l10n/l10n.dart';
++import 'package:fluffychat/utils/platform_infos.dart';
  import 'package:fluffychat/widgets/app_lock.dart';
 +import 'package:fluffychat/widgets/bottom_back_gesture.dart';
  import 'package:fluffychat/widgets/theme_builder.dart';
  import 'package:flutter/material.dart';
  import 'package:go_router/go_router.dart';
-@@ -82,10 +83,16 @@ class FluffyChatApp extends StatelessWidget {
-           isLoggedIn: clients.any((client) => client.isLogged()),
-           // Need a navigator above the Matrix widget for
-           // displaying dialogs
+@@ -76,18 +78,30 @@ class FluffyChatApp extends StatelessWidget {
+         localizationsDelegates: L10n.localizationsDelegates,
+         supportedLocales: L10n.supportedLocales,
+         routerConfig: router,
+-        builder: (context, child) => AppLockWidget(
+-          pincode: appLockSettings.pincode,
+-          useBiometrics: appLockSettings.useBiometrics,
+-          isLoggedIn: clients.any((client) => client.isLogged()),
+-          // Need a navigator above the Matrix widget for
+-          // displaying dialogs
 -          child: Matrix(
 -            clients: clients,
 -            store: store,
 -            child: testWidget ?? child,
-+          child: Stack(
-+            fit: StackFit.expand,
-+            children: [
-+              Matrix(
-+                clients: clients,
-+                store: store,
-+                child: testWidget ?? child,
-+              ),
-+              const BottomBackGesture(),
-+            ],
-           ),
-         ),
+-          ),
+-        ),
++        builder: (context, child) {
++          Widget app = AppLockWidget(
++            pincode: appLockSettings.pincode,
++            useBiometrics: appLockSettings.useBiometrics,
++            isLoggedIn: clients.any((client) => client.isLogged()),
++            // Need a navigator above the Matrix widget for
++            // displaying dialogs
++            child: Stack(
++              fit: StackFit.expand,
++              children: [
++                Matrix(
++                  clients: clients,
++                  store: store,
++                  child: testWidget ?? child,
++                ),
++                const BottomBackGesture(),
++              ],
++            ),
++          );
++          if (PlatformInfos.isLinux) {
++            app = TooltipVisibility(visible: false, child: app);
++          }
++          return app;
++        },
        ),
+     );
+   }
 diff --git a/lib/widgets/local_notifications_extension.dart b/lib/widgets/local_notifications_extension.dart
-index 840a7d4b9..17ea8fd29 100644
+index 840a7d4b9..970eedf23 100644
 --- a/lib/widgets/local_notifications_extension.dart
 +++ b/lib/widgets/local_notifications_extension.dart
-@@ -13,8 +13,10 @@ import 'package:fluffychat/widgets/matrix.dart';
+@@ -6,15 +6,21 @@
+ import 'package:fluffychat/config/setting_keys.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/utils/client_download_content_extension.dart';
++import 'package:fluffychat/utils/diagnostic_trace.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/notification_background_handler.dart';
++import 'package:fluffychat/utils/platform_infos.dart';
+ import 'package:fluffychat/utils/push_helper.dart';
++import 'package:fluffychat/utils/sync_recovery.dart';
+ import 'package:fluffychat/widgets/matrix.dart';
  import 'package:flutter/foundation.dart';
  import 'package:flutter/material.dart';
  import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -420,33 +3052,87 @@ index 840a7d4b9..17ea8fd29 100644
  
  extension LocalNotificationsExtension on MatrixState {
    static final html.AudioElement _audioPlayer = html.AudioElement()
-@@ -22,12 +24,21 @@ extension LocalNotificationsExtension on MatrixState {
+@@ -22,18 +28,74 @@ extension LocalNotificationsExtension on MatrixState {
      ..load();
  
    Future<void> showLocalNotification(Event event) async {
 -    final l10n = L10n.of(context);
      final roomId = event.room.id;
+-    if (activeRoomId == roomId) {
+-      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
 +    if (event.senderId == client.userID) return;
 +    final inForeground =
 +        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
 +    if (inForeground) {
++      // Recents (helper) already notified for events that existed before this
++      // resume. Still chime for messages that arrive while we are open. 1s
++      // grace covers homeserver vs device clock skew.
++      if (event.originServerTs.isBefore(
++        lastBecameForegroundAt.add(const Duration(seconds: 1)),
++      )) {
++        if (PlatformInfos.isLinux) {
++          final olderBy = lastBecameForegroundAt
++              .difference(event.originServerTs)
++              .inSeconds;
++          DiagnosticTrace.chime(
++            roomId: roomId,
++            eventId: event.eventId,
++            decision: 'skipped-older-than-resume',
++            detail: 'older by ${olderBy}s',
++          );
++          SyncRecovery.noteSkippedOlder();
++        }
+         return;
+       }
 +      // Lomiri suppresses Postal banners for the focused app, so play Xylo
 +      // plus haptic here — including when the open room is the one that
 +      // just received the message.
-+      await UtMedia.playAlert();
-+      await UtMedia.haptic();
++      if (PlatformInfos.isLinux) SyncRecovery.notePlayed();
++      try {
++        await UtMedia.playAlert();
++        await UtMedia.haptic();
++        if (PlatformInfos.isLinux) {
++          DiagnosticTrace.chime(
++            roomId: roomId,
++            eventId: event.eventId,
++            decision: 'played',
++          );
++        }
++      } catch (e) {
++        if (PlatformInfos.isLinux) {
++          DiagnosticTrace.chime(
++            roomId: roomId,
++            eventId: event.eventId,
++            decision: 'play-failed',
++            detail: e.runtimeType.toString(),
++          );
++        }
++      }
 +      if (activeRoomId == roomId) return;
 +      return;
 +    }
-     if (activeRoomId == roomId) {
--      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
--        return;
--      }
++    // Recents / background on Ubuntu Touch: the click push helper posts the
++    // card. Postal here would duplicate it, and the paused isolate does not
++    // /sync new events anyway.
++    if (PlatformInfos.isLinux) {
++      DiagnosticTrace.chime(
++        roomId: roomId,
++        eventId: event.eventId,
++        decision: 'skipped-not-foreground',
++      );
 +      return;
      }
  
-     final title = event.room.getLocalizedDisplayname(
-@@ -83,30 +94,19 @@ extension LocalNotificationsExtension on MatrixState {
+-    final title = event.room.getLocalizedDisplayname(
++    final title = event.room.uiDisplayname(
+       MatrixLocals(L10n.of(context)),
+     );
+-    final body = await event.calcLocalizedBody(
++    final body = await event.uiLocalizedBody(
+       MatrixLocals(L10n.of(context)),
+       withSenderNamePrefix:
+           !event.room.isDirectChat ||
+@@ -83,30 +145,19 @@ extension LocalNotificationsExtension on MatrixState {
        return;
      }
  
@@ -489,3 +3175,1106 @@ index 840a7d4b9..17ea8fd29 100644
      );
    }
  }
+diff --git a/lib/widgets/matrix.dart b/lib/widgets/matrix.dart
+--- a/lib/widgets/matrix.dart
++++ b/lib/widgets/matrix.dart
+@@ -9,10 +9,13 @@
+ import 'package:collection/collection.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/utils/client_manager.dart';
++import 'package:fluffychat/utils/diagnostic_trace.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/utils/init_with_restore.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_file_extension.dart';
+ import 'package:fluffychat/utils/notification_background_handler.dart';
+ import 'package:fluffychat/utils/platform_infos.dart';
++import 'package:fluffychat/utils/sync_recovery.dart';
+ import 'package:fluffychat/utils/uia_request_manager.dart';
+ import 'package:fluffychat/utils/voip_plugin.dart';
+ import 'package:fluffychat/widgets/adaptive_dialogs/show_ok_cancel_alert_dialog.dart';
+@@ -201,11 +204,30 @@
+     return route.split('/')[2];
+   }
+ 
++  /// Device time of the last [AppLifecycleState.resumed]. In-app alerts skip
++  /// events older than this so recents push is not replayed as a chime on open.
++  DateTime lastBecameForegroundAt = DateTime.now();
++
++  /// Starts true so the first foreground frame does not throw away a healthy
++  /// sync. Flips when the app actually leaves and comes back.
++  bool _linuxForeground = true;
++
+   @override
+   void initState() {
+     super.initState();
+     _listener = AppLifecycleListener(onStateChange: didChangeAppLifecycleState);
++    final state = WidgetsBinding.instance.lifecycleState;
++    _linuxForeground = state == null || state == AppLifecycleState.resumed;
+     initMatrix();
++    if (PlatformInfos.isLinux) {
++      SyncRecovery.rearmNotifier = () async {
++        await backgroundPush?.restartLomiriNotifier();
++      };
++    }
++    ContactBook.load();
++    if (PlatformInfos.isLinux && _linuxForeground) {
++      SyncRecovery.watchRoutes(widget.clients);
++    }
+   }
+ 
+   AppLifecycleListener? _listener;
+@@ -281,6 +303,10 @@
+           FluffyChatApp.router.go('/');
+         });
+     onUiaRequest[name] ??= c.onUiaRequest.stream.listen(uiaRequestHandler);
++    if (PlatformInfos.isLinux) {
++      DiagnosticTrace.watch(c);
++      SyncRecovery.watch(c);
++    }
+     if (PlatformInfos.isWeb || PlatformInfos.isLinux) {
+       FlutterLocalNotificationsPlugin().initialize(
+         settings: InitializationSettings(
+@@ -313,6 +339,10 @@
+     onLogoutSub.remove(name);
+     onNotification[name]?.cancel();
+     onNotification.remove(name);
++    if (PlatformInfos.isLinux) {
++      DiagnosticTrace.unwatch(name);
++      SyncRecovery.unwatch(name);
++    }
+   }
+ 
+   void initMatrix() {
+@@ -365,18 +395,34 @@
+   }
+ 
+   void didChangeAppLifecycleState(AppLifecycleState state) {
++    final resumed = state == AppLifecycleState.resumed;
++    if (resumed) {
++      lastBecameForegroundAt = DateTime.now();
++    }
+     final foreground =
+         state != AppLifecycleState.inactive &&
+         state != AppLifecycleState.paused;
++    final recoverLinux = PlatformInfos.isLinux && resumed && !_linuxForeground;
+     for (final client in widget.clients) {
+-      client.syncPresence = state == AppLifecycleState.resumed
+-          ? null
+-          : PresenceType.unavailable;
+-      if (PlatformInfos.isMobile) {
+-        client.backgroundSync = foreground;
+-        client.requestHistoryOnLimitedTimeline = !foreground;
+-        Logs().v('Set background sync to', foreground);
++      client.syncPresence = resumed ? null : PresenceType.unavailable;
++      if (PlatformInfos.isMobile || PlatformInfos.isLinux) {
++        // Recents SIGSTOP often leaves lifecycle as resumed/hidden. Only a
++        // live resumed UI should keep /sync; otherwise the homeserver will
++        // HTTP-push to the click helper. Coming back on Linux does not join
++        // the request that was frozen in the background: SyncRecovery drops
++        // those sockets and catch-up syncs first.
++        final syncing = PlatformInfos.isLinux ? resumed : foreground;
++        client.backgroundSync = syncing && !recoverLinux;
++        client.requestHistoryOnLimitedTimeline = !syncing;
++        Logs().v('Set background sync to', syncing);
++      }
++    }
++    if (PlatformInfos.isLinux) {
++      DiagnosticTrace.lifecycle(state: state, backgroundSync: resumed);
++      if (recoverLinux) {
++        unawaited(SyncRecovery.onResumed(widget.clients));
+       }
++      _linuxForeground = resumed;
+     }
+   }
+ 
+@@ -406,6 +452,7 @@
+     onUiaRequest.clear();
+ 
+     voiceMessageEventId.dispose();
++    if (PlatformInfos.isLinux) SyncRecovery.stop();
+ 
+     super.dispose();
+   }
+diff --git a/lib/widgets/member_actions_popup_menu_button.dart b/lib/widgets/member_actions_popup_menu_button.dart
+index 460cd78d2..0cf00a406 100644
+--- a/lib/widgets/member_actions_popup_menu_button.dart
++++ b/lib/widgets/member_actions_popup_menu_button.dart
+@@ -4,6 +4,8 @@
+ // SPDX-License-Identifier: AGPL-3.0-or-later
+ 
+ import 'package:fluffychat/l10n/l10n.dart';
++import 'package:fluffychat/utils/contact_book.dart';
++import 'package:fluffychat/utils/platform_infos.dart';
+ import 'package:fluffychat/widgets/permission_slider_dialog.dart';
+ import 'package:flutter/material.dart';
+ import 'package:matrix/matrix.dart';
+@@ -22,7 +24,7 @@ Future<void> showMemberActionsPopupMenu({
+   final l10n = L10n.of(context);
+   final scaffoldMessenger = ScaffoldMessenger.of(context);
+   final theme = Theme.of(context);
+-  final displayname = user.calcDisplayname();
++  final displayname = user.uiDisplayname();
+   final isMe = user.room.client.userID == user.id;
+ 
+   final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+@@ -74,6 +76,17 @@ Future<void> showMemberActionsPopupMenu({
+             ],
+           ),
+         ),
++      if (PlatformInfos.isLinux && !isMe)
++        PopupMenuItem(
++          value: _MemberActions.setContactName,
++          child: Row(
++            children: [
++              const Icon(Icons.badge_outlined),
++              const SizedBox(width: 18),
++              const Text('Set contact name'),
++            ],
++          ),
++        ),
+       if (user.membership == Membership.knock)
+         PopupMenuItem(
+           value: _MemberActions.approve,
+@@ -221,6 +234,30 @@ Future<void> showMemberActionsPopupMenu({
+     case _MemberActions.mention:
+       onMention?.call();
+       return;
++    case _MemberActions.setContactName:
++      final current = ContactBook.localName(user.id) ?? '';
++      final name = await showTextInputDialog(
++        context: context,
++        title: 'Set contact name',
++        message:
++            'Shown only on this phone. It does not change the name on WhatsApp.',
++        hintText: 'Name',
++        initialText: current,
++        okLabel: l10n.ok,
++        cancelLabel: l10n.cancel,
++      );
++      if (name == null) return;
++      await ContactBook.assignName(user.id, name);
++      if (!context.mounted) return;
++      final shown = ContactBook.localName(user.id);
++      scaffoldMessenger.showSnackBar(
++        SnackBar(
++          content: Text(
++            shown == null ? 'Contact name cleared' : 'Showing as $shown',
++          ),
++        ),
++      );
++      return;
+     case _MemberActions.setPowerLevel:
+       final power = await showPermissionChooser(
+         context,
+@@ -364,6 +401,7 @@ Future<void> showMemberActionsPopupMenu({
+ enum _MemberActions {
+   info,
+   mention,
++  setContactName,
+   setPowerLevel,
+   makeAdmin,
+   makeModerator,
+diff --git a/lib/widgets/share_scaffold_dialog.dart b/lib/widgets/share_scaffold_dialog.dart
+index 6523d42ac..33a645522 100644
+--- a/lib/widgets/share_scaffold_dialog.dart
++++ b/lib/widgets/share_scaffold_dialog.dart
+@@ -8,6 +8,7 @@ import 'package:fluffychat/config/app_config.dart';
+ import 'package:fluffychat/config/themes.dart';
+ import 'package:fluffychat/l10n/l10n.dart';
+ import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
++import 'package:fluffychat/utils/contact_book.dart';
+ import 'package:fluffychat/widgets/adaptive_dialogs/show_ok_cancel_alert_dialog.dart';
+ import 'package:fluffychat/widgets/avatar.dart';
+ import 'package:fluffychat/widgets/matrix.dart';
+@@ -138,11 +139,15 @@ class _ShareScaffoldDialogState extends State<ShareScaffoldDialog> {
+             itemCount: rooms.length,
+             itemBuilder: (context, i) {
+               final room = rooms[i];
+-              final displayname = room.getLocalizedDisplayname(
++              final displayname = room.uiDisplayname(
++                MatrixLocals(L10n.of(context)),
++              );
++              final rawName = room.getLocalizedDisplayname(
+                 MatrixLocals(L10n.of(context)),
+               );
+               final value = selectedRoomId == room.id;
+-              final filterOut = !displayname.toLowerCase().contains(filter);
++              final filterOut = !displayname.toLowerCase().contains(filter) &&
++                  !rawName.toLowerCase().contains(filter);
+               if (!value && filterOut) {
+                 return const SizedBox.shrink();
+               }
+diff --git a/lib/config/setting_keys.dart b/lib/config/setting_keys.dart
+index 111111111..222222222 100644
+--- a/lib/config/setting_keys.dart
++++ b/lib/config/setting_keys.dart
+@@ -79,6 +79,7 @@ enum AppSettings<T> {
+   showThumbnailsInTimeline<bool>('chat.fluffy.showThumbnailsInTimeline', true),
+   doubleTapToReact<bool>('chat.fluffy.double_tap_to_react', false),
+   doubleTapReaction<String>('chat.fluffy.double_tap_reaction', '❤️'),
+-  benchmarksInLogs<bool>('chat.fluffy.benchmarks_in_logs', false);
++  benchmarksInLogs<bool>('chat.fluffy.benchmarks_in_logs', false),
++  diagnosticLogRoomId<String>('chat.fluffy.diagnostic_log_room', '');
+ 
+   final String key;
+diff --git a/lib/utils/diagnostic_trace.dart b/lib/utils/diagnostic_trace.dart
+new file mode 100644
+index 111111111..222222222 100644
+--- /dev/null
++++ b/lib/utils/diagnostic_trace.dart
+@@ -0,0 +1,321 @@
++import 'dart:async';
++import 'dart:convert';
++import 'dart:typed_data';
++
++import 'package:fluffychat/config/setting_keys.dart';
++import 'package:fluffychat/utils/platform_infos.dart';
++import 'package:flutter/widgets.dart';
++import 'package:matrix/matrix.dart';
++
++/// Ring buffer for the three Ubuntu Touch notification failures, plus a
++/// snapshot of why the app is idle at the moment the sidebar icon is pressed.
++class DiagnosticTrace {
++  DiagnosticTrace._();
++
++  static const _maxLines = 400;
++  static final List<String> _lines = <String>[];
++  static final Map<String, StreamSubscription<SyncStatusUpdate>> _subs = {};
++
++  static DateTime? _statusSince;
++  static SyncStatus? _status;
++  static String? _lastError;
++  static DateTime? _lastErrorAt;
++  static DateTime? _lastWaitingAt;
++  static DateTime? _lastFinishedAt;
++  static DateTime? _lastResumeAt;
++  static bool? _backgroundSync;
++  static AppLifecycleState? _lifecycle;
++  static bool _heartbeat = false;
++  static int _eventsSinceFinish = 0;
++  static int _playedSinceFinish = 0;
++  static final Map<String, String> _lastDecision = {};
++
++  static bool get heartbeatRunning => _heartbeat;
++
++  static void watch(Client client) {
++    if (_subs.containsKey(client.clientName)) return;
++    _subs[client.clientName] = client.onSyncStatus.stream.listen(
++      (update) => _onStatus(client, update),
++    );
++  }
++
++  static void unwatch(String clientName) {
++    _subs.remove(clientName)?.cancel();
++  }
++
++  static void setHeartbeat(bool running) {
++    if (_heartbeat == running) return;
++    _heartbeat = running;
++    add(
++      running
++          ? 'foreground heartbeat started; push helper muted'
++          : 'foreground heartbeat stopped; push helper may post',
++    );
++  }
++
++  static void lifecycle({
++    required AppLifecycleState state,
++    required bool backgroundSync,
++  }) {
++    final alreadyResumed =
++        _lifecycle == AppLifecycleState.resumed &&
++        state == AppLifecycleState.resumed;
++    _lifecycle = state;
++    _backgroundSync = backgroundSync;
++    if (state == AppLifecycleState.resumed) {
++      _lastResumeAt = DateTime.now();
++      add(
++        'lifecycle resumed${alreadyResumed ? ' while already resumed' : ''}, '
++        'cutoff moved, backgroundSync=$backgroundSync',
++      );
++    } else {
++      add('lifecycle ${state.name}, backgroundSync=$backgroundSync');
++    }
++  }
++
++  static void chime({
++    required String roomId,
++    required String eventId,
++    required String decision,
++    String? detail,
++  }) {
++    _eventsSinceFinish++;
++    if (decision == 'played') _playedSinceFinish++;
++    _lastDecision[roomId] = detail == null ? decision : '$decision $detail';
++    add(
++      'chime $decision room=$roomId event=$eventId'
++      '${detail == null ? '' : ' $detail'}',
++    );
++  }
++
++  static void add(String message) {
++    final line = _scrub(message);
++    if (line.toLowerCase().contains('access_token')) return;
++    _lines.add('${DateTime.now().toIso8601String()} $line');
++    if (_lines.length > _maxLines) {
++      _lines.removeRange(0, _lines.length - _maxLines);
++    }
++  }
++
++  static Future<void> send({
++    required Client client,
++    required DateTime resumeCutoff,
++  }) async {
++    final roomId = AppSettings.diagnosticLogRoomId.value.trim();
++    if (roomId.isEmpty) {
++      throw Exception('No diagnostic room chosen');
++    }
++    final room = client.getRoomById(roomId);
++    if (room == null) {
++      throw Exception('Diagnostic room is not joined: $roomId');
++    }
++    final version = await PlatformInfos.getVersion();
++    final text = buildReport(
++      client: client,
++      version: version,
++      resumeCutoff: resumeCutoff,
++    );
++    final stamp = DateTime.now()
++        .toIso8601String()
++        .replaceAll(':', '-')
++        .replaceAll('.', '-');
++    await room.sendFileEvent(
++      MatrixFile(
++        bytes: Uint8List.fromList(utf8.encode(text)),
++        name: 'fluffychat-diagnostics-$stamp.txt',
++      ),
++    );
++    await room.sendTextEvent('Diagnostic logs $version');
++  }
++
++  static String buildReport({
++    required Client client,
++    required String version,
++    required DateTime resumeCutoff,
++  }) {
++    final now = DateTime.now();
++    final status = client.onSyncStatus.value?.status ?? _status;
++    final statusAge = _statusSince == null
++        ? null
++        : now.difference(_statusSince!).inSeconds;
++    final sinceFinished = _lastFinishedAt == null
++        ? null
++        : now.difference(_lastFinishedAt!).inSeconds;
++    final sinceResume = _lastResumeAt == null
++        ? null
++        : now.difference(_lastResumeAt!).inSeconds;
++    final liveLifecycle =
++        WidgetsBinding.instance.lifecycleState?.name ?? 'unknown';
++    final unread = client.rooms
++        .where((room) => !room.isSpace && room.notificationCount > 0)
++        .toList();
++    final idle = _idleReason(
++      status: status,
++      statusAge: statusAge,
++      unread: unread,
++    );
++
++    final buffer = StringBuffer()
++      ..writeln('Diagnostic logs $version')
++      ..writeln('time: ${now.toIso8601String()}')
++      ..writeln('--- right now ---')
++      ..writeln('idle: $idle')
++      ..writeln('lifecycle: $liveLifecycle')
++      ..writeln(
++        'backgroundSync: ${_backgroundSync == null ? 'unknown' : _backgroundSync}',
++      )
++      ..writeln(
++        'syncStatus: ${status?.name ?? 'none'}'
++        '${statusAge == null ? '' : ' unchanged for ${statusAge}s'}',
++      )
++      ..writeln('syncPending: ${client.syncPending}')
++      ..writeln(
++        'seconds since last finished sync: ${sinceFinished ?? 'never'}',
++      )
++      ..writeln('last sync error: ${_lastError ?? 'none'}')
++      ..writeln(
++        'heartbeat: ${_heartbeat ? 'running (push helper muted)' : 'stopped'}',
++      )
++      ..writeln(
++        'resume cutoff: ${resumeCutoff.toIso8601String()}'
++        '${sinceResume == null ? '' : ' (${sinceResume}s ago)'}',
++      )
++      ..writeln(
++        'notification events since last finished sync: $_eventsSinceFinish '
++        'played: $_playedSinceFinish',
++      );
++    if (unread.isEmpty) {
++      buffer.writeln('unread: none');
++    } else {
++      buffer.writeln('unread:');
++      for (final room in unread) {
++        final decision = _lastDecision[room.id] ?? 'no notification decision';
++        buffer.writeln(
++          '  ${room.id} count=${room.notificationCount} last=$decision',
++        );
++      }
++    }
++    buffer.writeln('--- trace ---');
++    if (_lines.isEmpty) {
++      buffer.writeln('(no trace yet)');
++    } else {
++      for (final line in _lines) {
++        buffer.writeln(line);
++      }
++    }
++    return buffer.toString();
++  }
++
++  static String _idleReason({
++    required SyncStatus? status,
++    required int? statusAge,
++    required List<Room> unread,
++  }) {
++    if (status == SyncStatus.error) {
++      return 'sync error'
++          '${statusAge == null ? '' : ' for ${statusAge}s'}'
++          ': ${_lastError ?? 'unknown'}';
++    }
++    if (status == SyncStatus.waitingForResponse &&
++        statusAge != null &&
++        statusAge >= 5) {
++      return 'sync still waitingForResponse for ${statusAge}s; '
++          'the room list has not moved';
++    }
++    final skipped = unread.where(
++      (room) =>
++          (_lastDecision[room.id] ?? '').startsWith('skipped-older-than-resume'),
++    );
++    if (unread.isNotEmpty && skipped.length == unread.length) {
++      return 'unread messages were skipped because they are older than this open';
++    }
++    if (_heartbeat && _playedSinceFinish == 0) {
++      return 'foreground heartbeat is running so the push helper is silent, '
++          'and no in-app chime has played since the last finished sync';
++    }
++    final muted = _heartbeat ? 'muted' : 'not muted';
++    return 'sync is ${status?.name ?? 'unknown'}, helper is $muted, '
++        'and no notification was attempted since the last finished sync';
++  }
++
++  static void _onStatus(Client client, SyncStatusUpdate update) {
++    final now = DateTime.now();
++    final sincePrev = _statusSince == null
++        ? 0
++        : now.difference(_statusSince!).inSeconds;
++    final anchor = _later(_lastErrorAt, _lastWaitingAt);
++    final sinceAnchor = anchor == null ? 0 : now.difference(anchor).inSeconds;
++    final timing =
++        '${sincePrev}s since previous, ${sinceAnchor}s since last error or waitingForResponse';
++    _status = update.status;
++    _statusSince = now;
++
++    if (update.status == SyncStatus.error) {
++      _lastError = _scrub(_shortError(update.error));
++      _lastErrorAt = now;
++      add('sync error ($timing): $_lastError');
++      return;
++    }
++    if (update.status == SyncStatus.waitingForResponse) {
++      _lastWaitingAt = now;
++      add('sync waitingForResponse ($timing)');
++      return;
++    }
++    if (update.status == SyncStatus.finished) {
++      final sinceResume = _lastResumeAt == null
++          ? null
++          : now.difference(_lastResumeAt!).inSeconds;
++      final sinceError = _lastErrorAt == null
++          ? null
++          : now.difference(_lastErrorAt!).inSeconds;
++      final unread = client.rooms
++          .where((room) => !room.isSpace && room.notificationCount > 0)
++          .length;
++      _lastFinishedAt = now;
++      add(
++        'sync finished ($timing)'
++        '${sinceResume == null ? '' : ', ${sinceResume}s since resume'}'
++        '${sinceError == null ? '' : ', ${sinceError}s since last error'}'
++        '; unreadRooms=$unread notificationEvents=$_eventsSinceFinish '
++        'played=$_playedSinceFinish',
++      );
++      if (unread > 0 && _eventsSinceFinish == 0) {
++        add('sync finished with unread rooms and zero notification events');
++      }
++      _eventsSinceFinish = 0;
++      _playedSinceFinish = 0;
++      return;
++    }
++    add('sync ${update.status.name} ($timing)');
++  }
++
++  static DateTime? _later(DateTime? a, DateTime? b) {
++    if (a == null) return b;
++    if (b == null) return a;
++    return a.isAfter(b) ? a : b;
++  }
++
++  static String _shortError(SdkError? error) {
++    final exception = error?.exception;
++    if (exception == null) return 'unknown';
++    final described = exception is SyncConnectionException
++        ? 'SyncConnectionException: ${exception.originalException}'
++        : exception.toString();
++    final raw = described.replaceAll('\n', ' ');
++    if (raw.toLowerCase().contains('access_token') || raw.contains('syt_')) {
++      return exception.runtimeType.toString();
++    }
++    if (raw.length <= 240) return raw;
++    return '${raw.substring(0, 240)} (${exception.runtimeType})';
++  }
++
++  static String _scrub(String message) {
++    return message
++        .replaceAll(
++          RegExp(r'access_token=[^&\s]+'),
++          'access_token=[redacted]',
++        )
++        .replaceAll(RegExp(r'syt_[A-Za-z0-9_]+'), 'syt_[redacted]')
++        .replaceAll(RegExp(r'Bearer [A-Za-z0-9._\-]+'), 'Bearer [redacted]');
++  }
++}
+diff --git a/lib/pages/chat_list/diagnostic_log_button.dart b/lib/pages/chat_list/diagnostic_log_button.dart
+new file mode 100644
+index 111111111..222222222 100644
+--- /dev/null
++++ b/lib/pages/chat_list/diagnostic_log_button.dart
+@@ -0,0 +1,223 @@
++import 'package:fluffychat/config/setting_keys.dart';
++import 'package:fluffychat/l10n/l10n.dart';
++import 'package:fluffychat/utils/adaptive_bottom_sheet.dart';
++import 'package:fluffychat/utils/contact_book.dart';
++import 'package:fluffychat/utils/diagnostic_trace.dart';
++import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
++import 'package:fluffychat/utils/sync_recovery.dart';
++import 'package:fluffychat/widgets/future_loading_dialog.dart';
++import 'package:fluffychat/widgets/matrix.dart';
++import 'package:flutter/material.dart';
++import 'package:matrix/matrix.dart';
++
++/// Re-registers the Lomiri pusher and drops a stuck /sync so messages and
++/// alerts can start again. The push helper process itself is started by
++/// lomiri-push-service when a push arrives; this only re-arms that path.
++class NotifierRestartButton extends StatelessWidget {
++  const NotifierRestartButton({super.key});
++
++  @override
++  Widget build(BuildContext context) {
++    final theme = Theme.of(context);
++    return IconButton(
++      visualDensity: VisualDensity.compact,
++      iconSize: 20,
++      color: theme.colorScheme.onSurfaceVariant,
++      tooltip: 'Restart notifier',
++      onPressed: () => _restart(context),
++      icon: const Icon(Icons.notifications_active_outlined),
++    );
++  }
++
++  static Future<void> _restart(BuildContext context) async {
++    final matrix = Matrix.of(context);
++    final result = await showFutureLoadingDialog(
++      context: context,
++      future: () async {
++        DiagnosticTrace.add('notifier restart requested');
++        await matrix.backgroundPush?.restartLomiriNotifier();
++        await SyncRecovery.onResumed(matrix.widget.clients, rearm: false);
++      },
++    );
++    if (!context.mounted) return;
++    final failed = result.isError;
++    ScaffoldMessenger.of(context).showSnackBar(
++      SnackBar(
++        content: Text(
++          failed ? 'Notifier restart failed' : 'Notifier restarted',
++        ),
++      ),
++    );
++  }
++}
++
++/// Small icon at the bottom of the left sidebar. A tap sends the diagnostic
++/// report when a room is saved; otherwise, and on long-press, it asks which
++/// room to use and confirms the first send.
++class DiagnosticLogButton extends StatelessWidget {
++  const DiagnosticLogButton({super.key});
++
++  @override
++  Widget build(BuildContext context) {
++    final theme = Theme.of(context);
++    return Padding(
++      padding: const EdgeInsets.only(bottom: 8),
++      child: IconButton(
++        visualDensity: VisualDensity.compact,
++        iconSize: 20,
++        color: theme.colorScheme.onSurfaceVariant,
++        onPressed: () => _onTap(context),
++        onLongPress: () => _pickAndSend(context),
++        icon: const Icon(Icons.bug_report_outlined),
++      ),
++    );
++  }
++
++  static Future<void> _onTap(BuildContext context) async {
++    final roomId = AppSettings.diagnosticLogRoomId.value.trim();
++    final client = Matrix.of(context).client;
++    if (roomId.isEmpty || client.getRoomById(roomId) == null) {
++      await _pickAndSend(context);
++      return;
++    }
++    if (!context.mounted) return;
++    await _send(context);
++  }
++
++  static Future<void> _pickAndSend(BuildContext context) async {
++    final client = Matrix.of(context).client;
++    final chosen = await showAdaptiveBottomSheet<String>(
++      context: context,
++      builder: (context) => _DiagnosticRoomSheet(client: client),
++    );
++    if (chosen == null || chosen.isEmpty || !context.mounted) return;
++    await AppSettings.diagnosticLogRoomId.setItem(chosen);
++    if (!context.mounted) return;
++    await _send(context);
++  }
++
++  static Future<void> _send(BuildContext context) async {
++    final matrix = Matrix.of(context);
++    await showFutureLoadingDialog(
++      context: context,
++      future: () => DiagnosticTrace.send(
++        client: matrix.client,
++        resumeCutoff: matrix.lastBecameForegroundAt,
++      ),
++    );
++  }
++}
++
++class _DiagnosticRoomSheet extends StatefulWidget {
++  final Client client;
++
++  const _DiagnosticRoomSheet({required this.client});
++
++  @override
++  State<_DiagnosticRoomSheet> createState() => _DiagnosticRoomSheetState();
++}
++
++class _DiagnosticRoomSheetState extends State<_DiagnosticRoomSheet> {
++  late final TextEditingController _paste;
++  String? _selected;
++
++  @override
++  void initState() {
++    super.initState();
++    final saved = AppSettings.diagnosticLogRoomId.value.trim();
++    _selected = saved.isEmpty ? null : saved;
++    _paste = TextEditingController();
++  }
++
++  @override
++  void dispose() {
++    _paste.dispose();
++    super.dispose();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final rooms = widget.client.rooms
++        .where((room) => !room.isSpace && room.membership == Membership.join)
++        .toList();
++    rooms.sort(
++      (a, b) => a
++          .uiDisplayname(MatrixLocals(L10n.of(context)))
++          .toLowerCase()
++          .compareTo(
++            b.uiDisplayname(MatrixLocals(L10n.of(context))).toLowerCase(),
++          ),
++    );
++    return SafeArea(
++      child: Column(
++        mainAxisSize: MainAxisSize.min,
++        crossAxisAlignment: CrossAxisAlignment.stretch,
++        children: [
++          Padding(
++            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
++            child: Text(
++              'Send diagnostic logs',
++              style: Theme.of(context).textTheme.titleMedium,
++            ),
++          ),
++          Flexible(
++            child: ListView.builder(
++              shrinkWrap: true,
++              itemCount: rooms.length,
++              itemBuilder: (context, i) {
++                final room = rooms[i];
++                final name = room.uiDisplayname(MatrixLocals(L10n.of(context)));
++                return RadioListTile<String>(
++                  value: room.id,
++                  groupValue: _paste.text.trim().isEmpty ? _selected : null,
++                  title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
++                  subtitle: Text(
++                    room.id,
++                    maxLines: 1,
++                    overflow: TextOverflow.ellipsis,
++                  ),
++                  onChanged: (id) => setState(() {
++                    _selected = id;
++                    _paste.clear();
++                  }),
++                );
++              },
++            ),
++          ),
++          Padding(
++            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
++            child: TextField(
++              controller: _paste,
++              decoration: const InputDecoration(
++                labelText: 'Or paste a room id',
++                isDense: true,
++              ),
++              onChanged: (_) => setState(() {}),
++            ),
++          ),
++          Padding(
++            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
++            child: FilledButton(
++              onPressed: _roomId == null
++                  ? null
++                  : () => Navigator.of(context).pop(_roomId),
++              child: const Text('Send'),
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++
++  String? get _roomId {
++    final pasted = _paste.text.trim();
++    if (pasted.isNotEmpty) {
++      return widget.client.getRoomById(pasted) == null ? null : pasted;
++    }
++    final selected = _selected;
++    if (selected == null || widget.client.getRoomById(selected) == null) {
++      return null;
++    }
++    return selected;
++  }
++}
+diff --git a/lib/utils/custom_http_client.dart b/lib/utils/custom_http_client.dart
+index bc94bf844..fe1cffbdd 100644
+--- a/lib/utils/custom_http_client.dart
++++ b/lib/utils/custom_http_client.dart
+@@ -35,7 +35,16 @@ class CustomHttpClient {
+     return HttpClient(context: context);
+   }
+ 
+-  static http.Client createHTTPClient() => retry.RetryClient(
+-    PlatformInfos.isAndroid ? IOClient(customHttpClient()) : http.Client(),
+-  );
++  /// New TCP connects fail at 8s instead of sitting in the sync loop's 40s
++  /// client timeout after a network change.
++  static const connectionTimeout = Duration(seconds: 8);
++
++  static http.Client createHTTPClient() {
++    if (PlatformInfos.isAndroid || PlatformInfos.isLinux) {
++      final io = (PlatformInfos.isAndroid ? customHttpClient() : HttpClient())
++        ..connectionTimeout = connectionTimeout;
++      return retry.RetryClient(IOClient(io));
++    }
++    return retry.RetryClient(http.Client());
++  }
+ }
+diff --git a/lib/utils/sync_recovery.dart b/lib/utils/sync_recovery.dart
+new file mode 100644
+index 111111111..222222222 100644
+--- /dev/null
++++ b/lib/utils/sync_recovery.dart
+@@ -0,0 +1,275 @@
++import 'dart:async';
++import 'dart:io';
++
++import 'package:fluffychat/utils/custom_http_client.dart';
++import 'package:fluffychat/utils/diagnostic_trace.dart';
++import 'package:flutter/widgets.dart';
++import 'package:matrix/matrix.dart';
++import 'package:ut_media/ut_media.dart';
++
++/// Drops keep-alive sockets after a resume, a dead /sync, or a route change,
++/// then fetches pending events before the normal long-poll starts again.
++class SyncRecovery {
++  SyncRecovery._();
++
++  static const _watchdog = Duration(seconds: 10);
++  static const _routePoll = Duration(seconds: 2);
++
++  static final Map<String, StreamSubscription<SyncStatusUpdate>> _subs = {};
++  static List<Client> _clients = [];
++  static Timer? _routeTimer;
++  static Timer? _catchUpWatchdog;
++  static String? _route;
++  static bool _inRecovery = false;
++  static bool _recoverAgain = false;
++  static bool _rearming = false;
++  static bool _rearmAgain = false;
++
++  /// Re-register the Lomiri pusher. Set by the app once push is constructed.
++  static Future<void> Function()? rearmNotifier;
++
++  /// Set when a real timeout or connection failure happens outside recovery.
++  /// Cleared on the next successful sync. Errors caused by closing the old
++  /// client during recovery are not counted, so a normal open does not chime
++  /// twice.
++  static bool _errorStreak = false;
++  static bool _playedThisSync = false;
++  static bool _skippedOlderThisSync = false;
++
++  static void watch(Client client) {
++    if (_subs.containsKey(client.clientName)) return;
++    _subs[client.clientName] = client.onSyncStatus.stream.listen(
++      (update) => _onStatus(client, update),
++    );
++    if (!_clients.any((known) => known.clientName == client.clientName)) {
++      _clients = [..._clients, client];
++    }
++  }
++
++  static void unwatch(String clientName) {
++    _subs.remove(clientName)?.cancel();
++    _clients = [
++      for (final client in _clients)
++        if (client.clientName != clientName) client,
++    ];
++  }
++
++  static void watchRoutes(List<Client> clients) {
++    _clients = List<Client>.from(clients);
++    _route = _readRoute();
++    // Stays running in Recents. A network change drops lomiri-push-service's
++    // connection while this process is often still scheduled, and
++    // re-registering is what brings the next notification through. Sync is
++    // only restarted when the UI is actually resumed.
++    _routeTimer ??= Timer.periodic(_routePoll, (_) => _pollRoute());
++  }
++
++  static void stop() {
++    _routeTimer?.cancel();
++    _routeTimer = null;
++    _cancelCatchUpWatchdog();
++    for (final sub in _subs.values) {
++      sub.cancel();
++    }
++    _subs.clear();
++    _clients = [];
++  }
++
++  static Future<void> onResumed(
++    List<Client> clients, {
++    bool rearm = true,
++  }) async {
++    watchRoutes(clients);
++    await _recoverAll(clients);
++    if (rearm) unawaited(_rearm());
++  }
++
++  static void notePlayed() {
++    _playedThisSync = true;
++  }
++
++  static void noteSkippedOlder() {
++    _skippedOlderThisSync = true;
++  }
++
++  static void _onStatus(Client client, SyncStatusUpdate update) {
++    if (update.status == SyncStatus.finished) {
++      _onFinished();
++      return;
++    }
++    if (update.status != SyncStatus.error) return;
++    if (!_recoverable(update.error?.exception)) return;
++    // Closing the old client during recovery surfaces as this same error.
++    if (_inRecovery) return;
++    _errorStreak = true;
++    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
++      return;
++    }
++    unawaited(_recoverAll(_clients.isEmpty ? [client] : _clients));
++  }
++
++  static void _onFinished() {
++    _cancelCatchUpWatchdog();
++    final chime = _errorStreak && _skippedOlderThisSync && !_playedThisSync;
++    _errorStreak = false;
++    _playedThisSync = false;
++    _skippedOlderThisSync = false;
++    if (!chime) return;
++    DiagnosticTrace.add('catch-up chime after sync errors');
++    unawaited(_playCatchUp());
++  }
++
++  static Future<void> _playCatchUp() async {
++    try {
++      await UtMedia.playAlert();
++      await UtMedia.haptic();
++    } catch (e) {
++      DiagnosticTrace.add('catch-up chime failed ${e.runtimeType}');
++    }
++  }
++
++  static bool _recoverable(Object? exception) {
++    return exception is TimeoutException ||
++        exception is SyncConnectionException;
++  }
++
++  static Future<void> _recoverAll(List<Client> clients) async {
++    if (_inRecovery) {
++      _recoverAgain = true;
++      return;
++    }
++    _inRecovery = true;
++    try {
++      do {
++        _recoverAgain = false;
++        for (final client in clients) {
++          if (!client.isLogged()) continue;
++          await _recoverClient(client);
++        }
++      } while (_recoverAgain);
++    } finally {
++      _inRecovery = false;
++    }
++  }
++
++  static Future<void> _recoverClient(Client client) async {
++    DiagnosticTrace.add('sync recovery: drop sockets and catch up');
++    final status = client.onSyncStatus.value?.status;
++    final retryQueued =
++        client.syncPending && status != SyncStatus.waitingForResponse;
++    client.backgroundSync = false;
++    _recycle(client);
++    if (retryQueued) {
++      // The failed sync already scheduled its retry. That retry reads
++      // httpClient when it sends, so it picks up the sockets just installed.
++      // A second oneShotSync here would race it and drop one of the responses.
++      // No watchdog here: this retry is the normal long-poll, and a 10s
++      // timer left running would close that socket. A dead route fails the
++      // connect in 8s; a stuck long-poll fails the loop's own 40s timeout.
++      client.backgroundSync = true;
++      return;
++    }
++    await _waitUntilIdle(client);
++    final caughtUp = await _catchUp(client);
++    if (!caughtUp) {
++      DiagnosticTrace.add('sync recovery: catch-up still waiting, retrying');
++      client.backgroundSync = false;
++      _recycle(client);
++      await _waitUntilIdle(client);
++      await _catchUp(client);
++    }
++    client.backgroundSync = true;
++  }
++
++  static Future<void> _waitUntilIdle(Client client) async {
++    final deadline = DateTime.now().add(const Duration(seconds: 2));
++    while (client.syncPending && DateTime.now().isBefore(deadline)) {
++      await Future<void>.delayed(const Duration(milliseconds: 20));
++    }
++    if (!client.syncPending) return;
++    await client.abortSync();
++    await Future<void>.delayed(Duration.zero);
++  }
++
++  static void _cancelCatchUpWatchdog() {
++    _catchUpWatchdog?.cancel();
++    _catchUpWatchdog = null;
++  }
++
++  /// Returns true when the immediate sync finished. The 10s timer covers only
++  /// this zero-timeout catch-up. It is cancelled when that request ends, so
++  /// it cannot close the long-poll that starts afterward.
++  static Future<bool> _catchUp(Client client) async {
++    _cancelCatchUpWatchdog();
++    _catchUpWatchdog = Timer(_watchdog, () {
++      if (client.onSyncStatus.value?.status == SyncStatus.waitingForResponse) {
++        DiagnosticTrace.add('sync recovery: catch-up watchdog');
++        _recycle(client);
++      }
++    });
++    try {
++      await client.oneShotSync(timeout: Duration.zero);
++    } finally {
++      _cancelCatchUpWatchdog();
++    }
++    return client.onSyncStatus.value?.status == SyncStatus.finished;
++  }
++
++  static void _recycle(Client client) {
++    final outer = client.httpClient;
++    if (outer is! TimeoutHttpClient) return;
++    final previous = outer.inner;
++    outer.inner = CustomHttpClient.createHTTPClient();
++    previous.close();
++  }
++
++  static void _pollRoute() {
++    final next = _readRoute();
++    if (next == null) return;
++    final previous = _route;
++    _route = next;
++    if (previous == null || previous == next) return;
++    DiagnosticTrace.add('default route changed');
++    final foreground =
++        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
++    if (foreground) unawaited(_recoverAll(_clients));
++    unawaited(_rearm());
++  }
++
++  static Future<void> _rearm() async {
++    final rearm = rearmNotifier;
++    if (rearm == null) return;
++    if (_rearming) {
++      _rearmAgain = true;
++      return;
++    }
++    _rearming = true;
++    try {
++      do {
++        _rearmAgain = false;
++        await rearm();
++      } while (_rearmAgain);
++    } finally {
++      _rearming = false;
++    }
++  }
++
++  /// `Iface destination gateway ... metric` for the default route.
++  static String? _readRoute() {
++    try {
++      final lines = File('/proc/net/route').readAsLinesSync();
++      final defaults = <String>[];
++      for (final line in lines.skip(1)) {
++        final parts = line.split(RegExp(r'\s+'));
++        if (parts.length < 7) continue;
++        if (parts[1] != '00000000') continue;
++        defaults.add('${parts[0]}:${parts[2]}:${parts[6]}');
++      }
++      if (defaults.isEmpty) return '';
++      defaults.sort();
++      return defaults.join(',');
++    } catch (_) {
++      return null;
++    }
++  }
++}
