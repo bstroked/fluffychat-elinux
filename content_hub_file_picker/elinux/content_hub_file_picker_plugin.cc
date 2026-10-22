@@ -37,7 +37,9 @@ namespace {
 
 constexpr char kChannelName[] = "content_hub_file_picker";
 constexpr char kListSourcesMethod[] = "listSources";
+constexpr char kListDestinationsMethod[] = "listDestinations";
 constexpr char kImportFromPeerMethod[] = "importFromPeer";
+constexpr char kExportToPeerMethod[] = "exportToPeer";
 constexpr char kClearTempMethod[] = "clearTemporaryFiles";
 
 // Well-known bus name + object path the content-hub daemon registers.
@@ -47,7 +49,10 @@ constexpr char kServiceBusName[] = "com.lomiri.content.dbus.Service";
 constexpr char kServiceObjectPath[] = "/";
 
 // Transfer::State enum values from transfer.h
+constexpr gint kStateCharged = 3;
+constexpr gint kStateCollected = 4;
 constexpr gint kStateAborted = 5;
+constexpr gint kStateFinalized = 6;
 
 // -- Callback data passed into the GLib thread --
 
@@ -354,9 +359,11 @@ static void on_transfer_props_changed(GDBusProxy* proxy,
   }
 }
 
-// Lists the apps (peers) that can supply the requested content type, so the
-// Dart side can present a "Choose from" picker. Runs on a detached thread.
-static void DoListSources(
+// Lists peers for a content type. destinations=false is sources (import);
+// destinations=true is apps that can receive an export, such as the media
+// player. Runs on a detached thread.
+static void DoListPeers(
+    bool destinations,
     std::string content_type,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   GError* err = nullptr;
@@ -382,12 +389,18 @@ static void DoListSources(
   }
 
   GVariant* peers = nullptr;
-  if (!content_hub_service_call_known_sources_for_type_sync(
-          service, content_type.c_str(), &peers,
-          /*cancellable=*/nullptr, &err)
-      || !peers) {
-    result->Error("KNOWN_SOURCES",
-                  err ? err->message : "Cannot list sources for content type");
+  const gboolean listed =
+      destinations
+          ? content_hub_service_call_known_destinations_for_type_sync(
+                service, content_type.c_str(), &peers,
+                /*cancellable=*/nullptr, &err)
+          : content_hub_service_call_known_sources_for_type_sync(
+                service, content_type.c_str(), &peers,
+                /*cancellable=*/nullptr, &err);
+  if (!listed || !peers) {
+    result->Error(destinations ? "KNOWN_DESTINATIONS" : "KNOWN_SOURCES",
+                  err ? err->message
+                      : "Cannot list peers for content type");
     if (err) g_error_free(err);
     g_object_unref(service);
     g_object_unref(conn);
@@ -588,6 +601,187 @@ static void DoImportFromPeer(
   result->Success(flutter::EncodableValue(std::move(uris)));
 }
 
+// Transfer::State poll while an export is in flight. Charge copies the file
+// into the hub store before it returns; we still wait until the destination
+// collects (or aborts) so a failure is visible instead of a silent no-op.
+struct ExportWait {
+  GMainLoop* loop = nullptr;
+  ContentHubTransfer* transfer = nullptr;
+  gint state = 0;
+  int ticks = 0;
+};
+
+static gboolean PollExport(gpointer data) {
+  auto* wait = static_cast<ExportWait*>(data);
+  gint state = wait->state;
+  GError* err = nullptr;
+  if (!content_hub_transfer_call_state_sync(wait->transfer, &state,
+                                            /*cancellable=*/nullptr, &err)) {
+    g_warning("content_hub_file_picker: export state: %s",
+              err ? err->message : "unknown");
+  }
+  if (err) g_error_free(err);
+  wait->state = state;
+  if (state == kStateCollected || state == kStateFinalized ||
+      state == kStateAborted || ++wait->ticks >= 100) {
+    g_main_loop_quit(wait->loop);
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+// One content-hub Item: (streamType:s, stream:ay, name:s, url:s).
+static GVariant* MakeExportItems(const std::string& name,
+                                 const std::string& uri) {
+  GVariantBuilder item;
+  g_variant_builder_init(&item, G_VARIANT_TYPE("(sayss)"));
+  g_variant_builder_add(&item, "s", "");
+  g_variant_builder_add_value(
+      &item, g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, nullptr, 0, 1));
+  g_variant_builder_add(&item, "s", name.c_str());
+  g_variant_builder_add(&item, "s", uri.c_str());
+
+  GVariantBuilder items;
+  g_variant_builder_init(&items, G_VARIANT_TYPE("av"));
+  g_variant_builder_add(&items, "v", g_variant_builder_end(&item));
+  return g_variant_ref_sink(g_variant_builder_end(&items));
+}
+
+// Exports one local file to a destination peer (the system media player).
+// Runs on a detached thread. Succeeds once the transfer is charged and the
+// peer has collected it, or once it stays charged until the wait expires
+// (the hub has already copied the file and launched the peer).
+static void DoExportToPeer(
+    std::string peer_id,
+    std::string content_type,
+    std::string path,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (!g_file_test(path.c_str(), G_FILE_TEST_IS_REGULAR)) {
+    result->Error("NO_FILE", "File to export does not exist");
+    return;
+  }
+  // The hub process reads the file while copying it into the peer's store.
+  g_chmod(path.c_str(), 0644);
+
+  GError* err = nullptr;
+  gchar* uri = g_filename_to_uri(path.c_str(), /*hostname=*/nullptr, &err);
+  if (!uri) {
+    result->Error("URI", err ? err->message : "Cannot build file URI");
+    if (err) g_error_free(err);
+    return;
+  }
+  gchar* base = g_path_get_basename(path.c_str());
+  const std::string name = base ? base : "video";
+  g_free(base);
+
+  GDBusConnection* conn =
+      g_bus_get_sync(G_BUS_TYPE_SESSION, /*cancellable=*/nullptr, &err);
+  if (!conn) {
+    g_free(uri);
+    result->Error("DBUS_CONNECT",
+                  err ? err->message : "Cannot connect to session bus");
+    if (err) g_error_free(err);
+    return;
+  }
+
+  const std::string app_id = GetAppArmorLabel(conn);
+  ContentHubService* service = content_hub_service_proxy_new_sync(
+      conn, G_DBUS_PROXY_FLAGS_NONE, kServiceBusName, kServiceObjectPath,
+      /*cancellable=*/nullptr, &err);
+  if (!service) {
+    g_free(uri);
+    result->Error("SERVICE_PROXY",
+                  err ? err->message : "Cannot create service proxy");
+    if (err) g_error_free(err);
+    g_object_unref(conn);
+    return;
+  }
+
+  gchar* transfer_path = nullptr;
+  if (!content_hub_service_call_create_export_to_peer_sync(
+          service, peer_id.c_str(), app_id.c_str(), content_type.c_str(),
+          &transfer_path, /*cancellable=*/nullptr, &err) ||
+      !transfer_path) {
+    g_free(uri);
+    std::string msg = std::string("Cannot create export transfer (app_id='") +
+                      app_id + "'): " + (err ? err->message : "unknown");
+    result->Error("CREATE_TRANSFER", msg);
+    if (err) g_error_free(err);
+    g_object_unref(service);
+    g_object_unref(conn);
+    return;
+  }
+
+  ContentHubTransfer* transfer = content_hub_transfer_proxy_new_sync(
+      conn, G_DBUS_PROXY_FLAGS_NONE, kServiceBusName, transfer_path,
+      /*cancellable=*/nullptr, &err);
+  g_free(transfer_path);
+  if (!transfer) {
+    g_free(uri);
+    result->Error("TRANSFER_PROXY",
+                  err ? err->message : "Cannot create transfer proxy");
+    if (err) g_error_free(err);
+    g_object_unref(service);
+    g_object_unref(conn);
+    return;
+  }
+
+  GVariant* items = MakeExportItems(name, uri);
+  g_free(uri);
+  const gboolean charged = content_hub_transfer_call_charge_sync(
+      transfer, items, /*cancellable=*/nullptr, &err);
+  g_variant_unref(items);
+  if (!charged) {
+    result->Error("CHARGE", err ? err->message : "Cannot charge transfer");
+    if (err) g_error_free(err);
+    g_object_unref(transfer);
+    g_object_unref(service);
+    g_object_unref(conn);
+    return;
+  }
+  if (err) g_error_free(err);
+  err = nullptr;
+
+  gint state = 0;
+  if (!content_hub_transfer_call_state_sync(transfer, &state,
+                                            /*cancellable=*/nullptr, &err)) {
+    g_warning("content_hub_file_picker: export state after charge: %s",
+              err ? err->message : "unknown");
+  }
+  if (err) g_error_free(err);
+
+  if (state != kStateCollected && state != kStateFinalized &&
+      state != kStateAborted) {
+    GMainContext* ctx = g_main_context_new();
+    GMainLoop* loop = g_main_loop_new(ctx, FALSE);
+    ExportWait wait;
+    wait.loop = loop;
+    wait.transfer = transfer;
+    wait.state = state;
+    GSource* source = g_timeout_source_new(200);
+    g_source_set_callback(source, PollExport, &wait, nullptr);
+    g_source_attach(source, ctx);
+    g_source_unref(source);
+    g_main_loop_run(loop);
+    state = wait.state;
+    g_main_loop_unref(loop);
+    g_main_context_unref(ctx);
+  }
+
+  g_object_unref(transfer);
+  g_object_unref(service);
+  g_object_unref(conn);
+
+  // Charged means the hub copied the file and asked the peer to open it.
+  // Collected/finalized means the peer took the file. Aborted is a failure.
+  const bool ok = state == kStateCharged || state == kStateCollected ||
+                  state == kStateFinalized;
+  if (!ok) {
+    g_warning("content_hub_file_picker: export ended in state %d", state);
+  }
+  result->Success(flutter::EncodableValue(ok));
+}
+
 }  // namespace
 
 // static
@@ -641,7 +835,19 @@ void ContentHubFilePickerPlugin::HandleMethodCall(
       return;
     }
     std::thread([ct = *content_type, res = std::move(result)]() mutable {
-      DoListSources(std::move(ct), std::move(res));
+      DoListPeers(/*destinations=*/false, std::move(ct), std::move(res));
+    }).detach();
+    return;
+  }
+
+  if (method == kListDestinationsMethod) {
+    const auto* content_type = get_string("contentType");
+    if (!content_type) {
+      result->Error("INVALID_ARGS", "Missing contentType");
+      return;
+    }
+    std::thread([ct = *content_type, res = std::move(result)]() mutable {
+      DoListPeers(/*destinations=*/true, std::move(ct), std::move(res));
     }).detach();
     return;
   }
@@ -660,6 +866,22 @@ void ContentHubFilePickerPlugin::HandleMethodCall(
                  res = std::move(result)]() mutable {
       DoImportFromPeer(std::move(pid), std::move(ct), st, /*app_id=*/std::string(),
                        std::move(res));
+    }).detach();
+    return;
+  }
+
+  if (method == kExportToPeerMethod) {
+    const auto* peer_id = get_string("peerId");
+    const auto* content_type = get_string("contentType");
+    const auto* path = get_string("path");
+    if (!peer_id || !content_type || !path) {
+      result->Error("INVALID_ARGS", "Missing peerId, contentType, or path");
+      return;
+    }
+    std::thread([pid = *peer_id, ct = *content_type, file = *path,
+                 res = std::move(result)]() mutable {
+      DoExportToPeer(std::move(pid), std::move(ct), std::move(file),
+                     std::move(res));
     }).detach();
     return;
   }

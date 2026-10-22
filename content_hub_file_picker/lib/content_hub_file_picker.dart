@@ -17,6 +17,65 @@ const _kTypeMusic = 'music';
 class ContentHubFilePickerPlugin {
   static const _channel = MethodChannel('content_hub_file_picker');
 
+  /// Hands [path] to another app through content-hub.
+  ///
+  /// Returns true when a destination accepted the file, false when nothing can
+  /// open it or the transfer failed, and null when the user dismissed the
+  /// "Open with" picker.
+  static Future<bool?> openWith(
+    String path, {
+    String contentType = 'videos',
+  }) async {
+    try {
+      final List<dynamic>? raw = await _channel.invokeListMethod<dynamic>(
+        'listDestinations',
+        {'contentType': contentType},
+      );
+      final peers = (raw ?? [])
+          .map((e) => _ContentPeer.fromMap((e as Map).cast<dynamic, dynamic>()))
+          .where((peer) => peer.id.isNotEmpty)
+          .toList();
+      if (peers.isEmpty) return false;
+
+      // Prefer the system media player only for videos; other types (PDFs,
+      // documents, music) need an explicit peer choice.
+      _ContentPeer? chosen;
+      if (contentType == 'videos') {
+        final media = peers.where(
+          (peer) => peer.id.toLowerCase().contains('mediaplayer'),
+        );
+        if (media.isNotEmpty) {
+          chosen = media.first;
+        }
+      }
+      if (chosen == null && peers.length == 1) {
+        chosen = peers.first;
+      }
+      if (chosen == null) {
+        final navigator = _findContentHubNavigator();
+        if (navigator == null) return false;
+        chosen = await navigator.push<_ContentPeer>(
+          MaterialPageRoute(
+            builder: (_) => _ContentPeerPickerPage(peers, title: 'Open with'),
+          ),
+        );
+        if (chosen == null) return null;
+      }
+
+      final ok = await _channel.invokeMethod<bool>('exportToPeer', {
+        'peerId': chosen.id,
+        'contentType': contentType,
+        'path': path,
+      });
+      return ok == true;
+    } on PlatformException catch (e) {
+      debugPrint('content_hub_file_picker: openWith failed: ${e.message}');
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
   // Called automatically by the Flutter plugin registrant. Plugins register
   // in alphabetical package order, so file_picker's FilePickerLinux would
   // overwrite a direct assignment here. Defer ours past all synchronous
@@ -109,20 +168,7 @@ class ContentHubFilePicker extends FilePickerPlatform {
   // Locates the app's root NavigatorState by walking the element tree. Avoids a
   // dependency on the host app (which would be circular) and needs no app-side
   // wiring to install a navigator key.
-  NavigatorState? _findNavigator() {
-    NavigatorState? navigator;
-    void visit(Element element) {
-      if (navigator != null) return;
-      if (element is StatefulElement && element.state is NavigatorState) {
-        navigator = element.state as NavigatorState;
-        return;
-      }
-      element.visitChildren(visit);
-    }
-
-    WidgetsBinding.instance.rootElement?.visitChildren(visit);
-    return navigator;
-  }
+  NavigatorState? _findNavigator() => _findContentHubNavigator();
 
   // Saving files via content-hub export is not implemented.
   @override
@@ -177,6 +223,22 @@ class ContentHubFilePicker extends FilePickerPlatform {
   }
 }
 
+// Locates the app's root NavigatorState by walking the element tree.
+NavigatorState? _findContentHubNavigator() {
+  NavigatorState? navigator;
+  void visit(Element element) {
+    if (navigator != null) return;
+    if (element is StatefulElement && element.state is NavigatorState) {
+      navigator = element.state as NavigatorState;
+      return;
+    }
+    element.visitChildren(visit);
+  }
+
+  WidgetsBinding.instance.rootElement?.visitChildren(visit);
+  return navigator;
+}
+
 // A content-hub source app, as returned by the native listSources method.
 class _ContentPeer {
   _ContentPeer({
@@ -208,9 +270,10 @@ class _ContentPeer {
 // Full-screen "Choose from" app picker, mirroring the Lomiri content-hub
 // ContentPeerPicker so the experience matches native UT apps.
 class _ContentPeerPickerPage extends StatelessWidget {
-  const _ContentPeerPickerPage(this.peers);
+  const _ContentPeerPickerPage(this.peers, {this.title = 'Choose from'});
 
   final List<_ContentPeer> peers;
+  final String title;
 
   @override
   Widget build(BuildContext context) {
@@ -220,7 +283,7 @@ class _ContentPeerPickerPage extends StatelessWidget {
           icon: const Icon(Icons.close),
           onPressed: () => Navigator.of(context).pop(),
         ),
-        title: const Text('Choose from'),
+        title: Text(title),
       ),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

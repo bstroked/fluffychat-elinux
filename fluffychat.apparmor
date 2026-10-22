@@ -10,7 +10,8 @@
         "content_exchange_source",
         "location",
         "keep-display-on",
-        "push-notification-client"
+        "push-notification-client",
+        "contacts"
     ],
     "policy_version": 20.04
 }

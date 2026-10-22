@@ -47,8 +47,6 @@ flutter::EncodableValue SuccessReply(flutter::EncodableValue value) {
       flutter::EncodableList{std::move(value)});
 }
 
-// Tries the url-dispatcher D-Bus service under the given well-known name.
-// Returns true if the daemon accepted the URL for dispatch.
 bool TryUrlDispatcher(GDBusConnection* conn, const char* name, const char* path,
                       const char* iface, const std::string& url) {
   GError* err = nullptr;

@@ -17,6 +17,14 @@ done
 echo "Engine artifacts:"
 ls -lh "${ENGINE_DIR}/"
 
+# Content-hub clipboard (empty CreatePaste) + text-input/composing fixes for UT.
+# Idempotent: already-applied trees (local dirty checkout) skip cleanly.
+if [ -f "${ROOT}/patches/flutter-embedded-linux-clipboard-input.patch" ]; then
+    patch -d "${SRC_DIR}" -p1 --forward --reject-file=/dev/null \
+        < "${ROOT}/patches/flutter-embedded-linux-clipboard-input.patch" \
+        >/dev/null 2>&1 || true
+fi
+
 # Copy libflutter_engine.so into the embedder source tree so cmake can find it
 # (flutter-embedded-linux/cmake/build.cmake looks for build/libflutter_engine.so)
 mkdir -p "${SRC_DIR}/build"

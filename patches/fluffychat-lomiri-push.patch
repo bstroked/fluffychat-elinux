@@ -15,7 +15,7 @@ index f29bd6d7d..2e2d645c5 100644
    static const double spaceBorderRadius = 11.0;
    static const double columnWidth = 360.0;
 diff --git a/lib/utils/background_push.dart b/lib/utils/background_push.dart
-index 8c1d1cbc9..fa27e7713 100644
+index 8c1d1cbc9..7abee487e 100644
 --- a/lib/utils/background_push.dart
 +++ b/lib/utils/background_push.dart
 @@ -20,6 +20,7 @@ import 'package:fluffychat/widgets/fluffy_chat_app.dart';
@@ -26,7 +26,23 @@ index 8c1d1cbc9..fa27e7713 100644
  import 'package:matrix/matrix.dart';
  import 'package:unifiedpush/unifiedpush.dart';
  import 'package:unifiedpush_ui/unifiedpush_ui.dart';
-@@ -173,6 +174,13 @@ class BackgroundPush {
+@@ -27,6 +28,7 @@ import 'package:unifiedpush_ui/unifiedpush_ui.dart';
+ import '../config/app_config.dart';
+ import '../config/setting_keys.dart';
+ import '../widgets/matrix.dart';
++import 'diagnostic_trace.dart';
+ import 'platform_infos.dart';
+ 
+ class BackgroundPush {
+@@ -151,6 +153,7 @@ class BackgroundPush {
+     instance.matrix = matrix;
+     // ignore: prefer_initializing_formals
+     instance.onFcmError = onFcmError;
++    instance._watchLomiriForegroundLock();
+     return instance;
+   }
+ 
+@@ -173,6 +176,13 @@ class BackgroundPush {
      }
      final appDisplayName = PlatformInfos.appDisplayName;
  
@@ -40,7 +56,7 @@ index 8c1d1cbc9..fa27e7713 100644
      final pushers =
          await (client.getPushers().catchError((e) {
            Logs().w('[Push] Unable to request pushers', e);
-@@ -186,7 +194,12 @@ class BackgroundPush {
+@@ -186,53 +196,73 @@ class BackgroundPush {
      if (deviceAppId.length > 64) {
        deviceAppId = deviceAppId.substring(0, 64);
      }
@@ -54,17 +70,97 @@ index 8c1d1cbc9..fa27e7713 100644
      if (gatewayUrl == null || token == null) {
        Logs().w('[Push] Missing required push credentials');
        return;
-@@ -203,8 +216,7 @@ class BackgroundPush {
-           currentPusher.deviceDisplayName == client.deviceName &&
-           currentPusher.lang == 'en' &&
-           currentPusher.data.url.toString() == gatewayUrl &&
+     }
+ 
+-    if (pushers.any(
+-      (currentPusher) =>
+-          currentPusher.pushkey == token &&
+-          currentPusher.data.additionalProperties['client_name'] ==
+-              client.clientName &&
+-          currentPusher.kind == 'http' &&
+-          currentPusher.appId == thisAppId &&
+-          currentPusher.appDisplayName == appDisplayName &&
+-          currentPusher.deviceDisplayName == client.deviceName &&
+-          currentPusher.lang == 'en' &&
+-          currentPusher.data.url.toString() == gatewayUrl &&
 -          currentPusher.data.format ==
 -              AppSettings.pushNotificationsPusherFormat.value &&
-+          currentPusher.data.format == pusherFormat &&
-           currentPusher.data.additionalProperties['data_message'] ==
-               pusherDataMessageFormat,
-     )) {
-@@ -244,7 +256,7 @@ class BackgroundPush {
+-          currentPusher.data.additionalProperties['data_message'] ==
+-              pusherDataMessageFormat,
+-    )) {
+-      Logs().i('[Push] Pusher already set for ${client.deviceID}');
+-      return;
+-    }
++    bool isDesiredPusher(Pusher currentPusher) =>
++        currentPusher.pushkey == token &&
++        currentPusher.data.additionalProperties['client_name'] ==
++            client.clientName &&
++        currentPusher.kind == 'http' &&
++        currentPusher.appId == thisAppId &&
++        currentPusher.appDisplayName == appDisplayName &&
++        currentPusher.deviceDisplayName == client.deviceName &&
++        currentPusher.lang == 'en' &&
++        currentPusher.data.url.toString() == gatewayUrl &&
++        currentPusher.data.format == pusherFormat &&
++        currentPusher.data.additionalProperties['data_message'] ==
++            pusherDataMessageFormat;
++
++    final desiredAlreadySet = pushers.any(isDesiredPusher);
+ 
+     if (!client.isLogged()) return;
+ 
+-    final legacyPushers = pushers.where(
+-      (pusher) =>
+-          pusher.appId == thisAppId || // To migrate older app-id format:
+-          ((pusher.appId == 'chat.fluffy.fluffychat.data_message' ||
+-                  pusher.appId == 'chat.fluffy.fluffychat') &&
+-              pusher.pushkey == token),
+-    );
+-    for (final pusher in legacyPushers) {
++    // Drop leftover FluffyChat pushers even when the desired one already
++    // exists. An older event_id_only registration (generic "New Message")
++    // would otherwise stay forever after the first successful setup, because
++    // we used to return before deleting extras.
++    final stalePushers = pushers.where((pusher) {
++      if (isDesiredPusher(pusher)) return false;
++      if (pusher.appId == thisAppId) return true;
++      if (pusher.appId.startsWith('$thisAppId.') && pusher.pushkey == token) {
++        return true;
++      }
++      if ((pusher.appId == 'chat.fluffy.fluffychat.data_message' ||
++              pusher.appId == 'chat.fluffy.fluffychat' ||
++              pusher.appId.startsWith('chat.fluffy.fluffychat.')) &&
++          pusher.pushkey == token) {
++        return true;
++      }
++      return false;
++    });
++    for (final pusher in stalePushers) {
+       try {
+         await client.deletePusher(pusher);
+-        Logs().i('[Push] Removed legacy pusher for ${client.deviceID}');
++        Logs().i(
++          '[Push] Removed stale pusher ${pusher.appId} '
++          'format=${pusher.data.format} for ${client.deviceID}',
++        );
+       } catch (err) {
+         Logs().w(
+-          '[Push] Failed to remove old pusher for ${client.deviceID}',
++          '[Push] Failed to remove stale pusher for ${client.deviceID}',
+           err,
+         );
+       }
+     }
+ 
++    if (desiredAlreadySet) {
++      Logs().i('[Push] Pusher already set for ${client.deviceID}');
++      return;
++    }
++
+     Logs().i('Need to set new pusher for ${client.clientName}');
+     try {
+       await client.postPusher(
+@@ -244,7 +274,7 @@ class BackgroundPush {
            lang: 'en',
            data: PusherData(
              url: Uri.parse(gatewayUrl),
@@ -73,20 +169,32 @@ index 8c1d1cbc9..fa27e7713 100644
              additionalProperties: {
                'client_name': client.clientName,
                'data_message': pusherDataMessageFormat,
-@@ -264,7 +276,11 @@ class BackgroundPush {
+@@ -263,8 +293,23 @@ class BackgroundPush {
+ 
    static bool _wentToRoomOnStartup = false;
  
++  /// Re-arm Ubuntu Touch notifications. lomiri-push-service starts the helper
++  /// when a push arrives; this gets a token again and posts the Matrix pusher
++  /// so that path is registered. A stuck /sync is a separate recovery.
++  Future<void> restartLomiriNotifier() async {
++    if (!PlatformInfos.isLinux) return;
++    _lomiriPushToken = null;
++    DiagnosticTrace.add('notifier re-register with lomiri-push-service');
++    await _setupLomiriPush();
++  }
++
    Future<void> setupPush(BuildContext context) async {
 -    if (PlatformInfos.isAndroid &&
 +    if (PlatformInfos.isLinux) {
 +      await _setupLomiriPush();
 +      _watchLomiriNotifications();
++      _watchLomiriForegroundLock();
 +      await _handleLomiriLaunchUrl();
 +    } else if (PlatformInfos.isAndroid &&
          (await UnifiedPush.getDistributors()).isNotEmpty &&
          context.mounted) {
        await UnifiedPushUi(
-@@ -291,6 +307,11 @@ class BackgroundPush {
+@@ -291,6 +335,11 @@ class BackgroundPush {
        }
      }
  
@@ -98,11 +206,138 @@ index 8c1d1cbc9..fa27e7713 100644
      // ignore: unawaited_futures
      _flutterLocalNotificationsPlugin.getNotificationAppLaunchDetails().then((
        details,
-@@ -313,6 +334,119 @@ class BackgroundPush {
+@@ -313,6 +362,246 @@ class BackgroundPush {
      });
    }
  
 +  String? _lomiriPushToken;
++  final List<File> _lomiriHeartbeatFiles = [];
++  Timer? _lomiriHeartbeat;
++  AppLifecycleListener? _lomiriLifecycle;
++  static const _lomiriHeartbeatInterval = Duration(seconds: 1);
++
++  static String _lomiriCacheDir() {
++    final xdg = Platform.environment['XDG_CACHE_HOME'];
++    if (xdg != null && xdg.isNotEmpty) {
++      return xdg.endsWith('fluffychat.notkit')
++          ? xdg
++          : '$xdg/fluffychat.notkit';
++    }
++    final home = Platform.environment['HOME'] ?? '/home/phablet';
++    return '$home/.cache/fluffychat.notkit';
++  }
++
++  static String? _lomiriRuntimeDir() {
++    final xdg = Platform.environment['XDG_RUNTIME_DIR'];
++    if (xdg == null || xdg.isEmpty) return null;
++    return xdg.endsWith('fluffychat.notkit')
++        ? xdg
++        : '$xdg/fluffychat.notkit';
++  }
++
++  List<String> _lomiriForegroundLockDirs() {
++    final dirs = <String>[];
++    void add(String? dir) {
++      if (dir == null || dir.isEmpty) return;
++      if (!dirs.contains(dir)) dirs.add(dir);
++    }
++
++    // tmpfs: gone after reboot, so a crashed session cannot mute the helper.
++    add(_lomiriRuntimeDir());
++    // Helper and app confinement may not share XDG_RUNTIME_DIR; cache is the
++    // path both already use. Fresh mtime (not fcntl) is the foreground check:
++    // recents SIGSTOP leaves an fcntl lock held forever.
++    add(_lomiriCacheDir());
++    return dirs;
++  }
++
++  /// Heartbeat the push helper can see. Refreshed every second while this
++  /// isolate is [AppLifecycleState.resumed]. Recents SIGSTOP's the process
++  /// before Dart can release an fcntl lock, so a stale mtime means "not
++  /// foreground" and the helper must still post.
++  Future<void> setLomiriForeground(bool foreground) async {
++    if (!PlatformInfos.isLinux) return;
++    if (foreground) {
++      await _startLomiriHeartbeat();
++    } else {
++      await _stopLomiriHeartbeat();
++    }
++  }
++
++  Future<void> _startLomiriHeartbeat() async {
++    await _ensureLomiriHeartbeatFiles();
++    await _writeLomiriHeartbeat();
++    _lomiriHeartbeat ??= Timer.periodic(
++      _lomiriHeartbeatInterval,
++      (_) => unawaited(_writeLomiriHeartbeat()),
++    );
++  }
++
++  Future<void> _ensureLomiriHeartbeatFiles() async {
++    if (_lomiriHeartbeatFiles.isNotEmpty) return;
++    for (final dirPath in _lomiriForegroundLockDirs()) {
++      try {
++        final dir = Directory(dirPath);
++        if (!await dir.exists()) {
++          await dir.create(recursive: true);
++        }
++        try {
++          await File('${dir.path}/running.lock').delete();
++        } catch (_) {}
++        _lomiriHeartbeatFiles.add(File('${dir.path}/foreground.lock'));
++      } catch (e) {
++        Logs().w('[Push] Unable to prepare heartbeat in $dirPath', e);
++      }
++    }
++    if (_lomiriHeartbeatFiles.isNotEmpty) {
++      DiagnosticTrace.setHeartbeat(true);
++      Logs().i('[Push] Started foreground heartbeat');
++    }
++  }
++
++  Future<void> _writeLomiriHeartbeat() async {
++    final payload = '$pid\n${DateTime.now().millisecondsSinceEpoch}\n';
++    for (final file in _lomiriHeartbeatFiles) {
++      try {
++        await file.writeAsString(payload, flush: true);
++      } catch (e) {
++        Logs().w('[Push] Unable to write heartbeat ${file.path}', e);
++      }
++    }
++  }
++
++  Future<void> _stopLomiriHeartbeat() async {
++    DiagnosticTrace.setHeartbeat(false);
++    _lomiriHeartbeat?.cancel();
++    _lomiriHeartbeat = null;
++    final files = List<File>.from(_lomiriHeartbeatFiles);
++    _lomiriHeartbeatFiles.clear();
++    if (files.isEmpty) return;
++    for (final file in files) {
++      try {
++        await file.delete();
++      } catch (_) {}
++    }
++    Logs().i('[Push] Stopped foreground heartbeat');
++  }
++
++  void _watchLomiriForegroundLock() {
++    if (_lomiriLifecycle != null) return;
++    _lomiriLifecycle = AppLifecycleListener(
++      onStateChange: (state) {
++        unawaited(setLomiriForeground(state == AppLifecycleState.resumed));
++      },
++    );
++    // Null lifecycleState means the first platform event has not landed yet.
++    // The GUI is starting, so heartbeat until we know we are not resumed.
++    // Recents SIGSTOP never delivers paused, so this must not wait on it.
++    final state = WidgetsBinding.instance.lifecycleState;
++    unawaited(
++      setLomiriForeground(
++        state == null || state == AppLifecycleState.resumed,
++      ),
++    );
++  }
 +
 +  /// Ubuntu Touch push: lomiri-push-service hands out a token identifying this
 +  /// user+device for our click package, and UBports runs a Matrix push gateway

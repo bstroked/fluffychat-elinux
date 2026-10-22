@@ -49,7 +49,8 @@ constexpr int kPreSkip = 312;
 constexpr int kGranulePerFrame = 48 * kFrameMs;
 constexpr int kFramesPerPacket = 6;
 constexpr int kPacketsPerPage = 16;
-constexpr int kMaxSeconds = 120;
+// Cap in-memory PCM (~55 MB worst case at 48 kHz mono for 10 minutes).
+constexpr int kMaxSeconds = 600;
 constexpr char kXyloPath[] =
     "/usr/share/sounds/lomiri/notifications/Xylo.ogg";
 
@@ -1015,7 +1016,8 @@ class UtMediaPlugin : public flutter::Plugin {
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   bool StartRecording(const std::string& path, std::string* error);
-  bool StopRecording(std::string* path_out, std::string* error);
+  bool StopRecording(std::string* path_out, int64_t* duration_ms,
+                     std::string* error);
   void Cancel();
 
   std::mutex mu_;
@@ -1134,7 +1136,8 @@ bool UtMediaPlugin::StartRecording(const std::string& path, std::string* error) 
   return true;
 }
 
-bool UtMediaPlugin::StopRecording(std::string* path_out, std::string* error) {
+bool UtMediaPlugin::StopRecording(std::string* path_out, int64_t* duration_ms,
+                                  std::string* error) {
   std::vector<int16_t> copy;
   std::string path;
   int rate = kEncoderRate;
@@ -1154,6 +1157,7 @@ bool UtMediaPlugin::StopRecording(std::string* path_out, std::string* error) {
   }
   auto mono = ToMono16(copy, std::max(1, channels));
   mono = ResampleTo16k(mono, rate);
+  *duration_ms = static_cast<int64_t>(mono.size()) * 1000 / kEncoderRate;
   if (path.empty()) {
     path = WritableDir() + "/voice_message.ogg";
   }
@@ -1460,12 +1464,17 @@ void UtMediaPlugin::HandleMethodCall(
     if (stop_thread_.joinable()) stop_thread_.join();
     stop_thread_ = std::thread([this, res = std::move(result)]() mutable {
       std::string path;
+      int64_t duration_ms = 0;
       std::string error;
-      if (!StopRecording(&path, &error)) {
+      if (!StopRecording(&path, &duration_ms, &error)) {
         res->Error("RECORD", error);
         return;
       }
-      res->Success(flutter::EncodableValue(path));
+      flutter::EncodableMap map;
+      map[flutter::EncodableValue("path")] = flutter::EncodableValue(path);
+      map[flutter::EncodableValue("durationMs")] =
+          flutter::EncodableValue(static_cast<int32_t>(duration_ms));
+      res->Success(flutter::EncodableValue(std::move(map)));
     });
     return;
   }

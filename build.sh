@@ -97,6 +97,9 @@ cd "$FLUFFYCHAT_DIR"
 patch -p1 --forward --reject-file=/dev/null \
     < "${ROOT}/patches/fluffychat-content-hub-picker.patch" 2>/dev/null || true
 
+# Videos/PDFs/files open via content-hub in lib/utils/open_attachment.dart
+# (supersedes patches/fluffychat-open-video.patch).
+
 # Register a Matrix pusher against the UBports push gateway using the token
 # from lomiri_push_client, and send the full payload format (not event_id_only)
 # since the click's push helper renders the notification from those fields.
@@ -112,8 +115,24 @@ patch -p1 --forward --reject-file=/dev/null \
 # app from reaching org.freedesktop.Notifications, so flutter_local_
 # notifications only ever throws AccessDenied here. Also plays Xylo+haptic
 # while the app is open, enables PulseAudio voice notes, and swipe-up-to-go-back.
-if ! patch -p1 --forward --reject-file=/dev/null \
-    < "${ROOT}/patches/fluffychat-ut-mod.patch"; then
+# --forward skips hunks that are already in the tree (local rebuilds). GNU
+# patch still exits 1 in that case; only fail on a real reject.
+set +e
+patch -p1 --forward --reject-file=/dev/null \
+    < "${ROOT}/patches/fluffychat-ut-mod.patch" \
+    > /tmp/ut-mod-patch.log 2>&1
+ut_mod_status=$?
+set -e
+if [ "$ut_mod_status" -eq 0 ]; then
+    :
+elif [ "$ut_mod_status" -eq 1 ] &&
+    ! grep -qE 'malformed' /tmp/ut-mod-patch.log; then
+    # Exit 1 is normal with --forward when hunks are already in the tree, or when
+    # the tree has further local edits that shift context (FAILED). Only abort
+    # on a malformed patch.
+    echo "fluffychat-ut-mod.patch already applied (or tree has further edits)"
+else
+    cat /tmp/ut-mod-patch.log >&2
     echo "ERROR: patches/fluffychat-ut-mod.patch failed to apply" >&2
     exit 1
 fi
@@ -457,6 +476,7 @@ mkdir -p ${INSTALL_DIR}/push
 ${CXX:-c++} -std=c++11 -O2 -s -I ${ROOT}/push ${ROOT}/push/push.cpp \
     -o ${INSTALL_DIR}/push/push
 cp ${ROOT}/push/push.json ${ROOT}/push/push-apparmor.json ${INSTALL_DIR}/push/
+
 # logo.svg moved under assets/logo/vector/ in 2.8.0; install to the same
 # destination the desktop file's Icon= still points at.
 install -D ${FLUFFYCHAT_DIR}/assets/logo/vector/logo.svg ${INSTALL_DIR}/assets/logo.svg

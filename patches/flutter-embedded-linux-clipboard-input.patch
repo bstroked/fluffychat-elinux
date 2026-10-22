@@ -1,0 +1,745 @@
+diff --git a/src/flutter/shell/platform/common/text_input_model.cc b/src/flutter/shell/platform/common/text_input_model.cc
+index d635465..523345c 100644
+--- a/src/flutter/shell/platform/common/text_input_model.cc
++++ b/src/flutter/shell/platform/common/text_input_model.cc
+@@ -37,8 +37,12 @@ void TextInputModel::SetText(const std::string& text) {
+   std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>
+       utf16_converter;
+   text_ = utf16_converter.from_bytes(text);
+-  selection_ = TextRange(0);
++  // Flutter is replacing the whole field. A leftover composing flag would
++  // shrink editable_range() to the old preedit, so SetSelection after this
++  // would fail and the caret would stay at 0.
++  composing_ = false;
+   composing_range_ = TextRange(0);
++  selection_ = TextRange(0);
+ }
+ 
+ bool TextInputModel::SetSelection(const TextRange& range) {
+diff --git a/src/flutter/shell/platform/linux_embedded/plugins/text_input_plugin.cc b/src/flutter/shell/platform/linux_embedded/plugins/text_input_plugin.cc
+index 9757ee2..9e89f44 100644
+--- a/src/flutter/shell/platform/linux_embedded/plugins/text_input_plugin.cc
++++ b/src/flutter/shell/platform/linux_embedded/plugins/text_input_plugin.cc
+@@ -119,6 +119,19 @@ constexpr char kInternalConsistencyError[] = "Internal Consistency Error";
+ // if a show arrives in the meantime.
+ constexpr guint kHideDelayMs = 100;
+ 
++// The keyboard is restarted by the session; give it ~10s to come back.
++constexpr guint kReconnectDelayMs = 500;
++constexpr int kMaxReconnectAttempts = 20;
++
++// Same lookup as libmaliit-glib's maliitbus.c.
++constexpr char kAddressEnv[] = "MALIIT_SERVER_ADDRESS";
++constexpr char kAddressBusName[] = "org.maliit.server";
++constexpr char kAddressObjectPath[] = "/org/maliit/server/address";
++constexpr char kAddressInterface[] = "org.maliit.Server.Address";
++constexpr char kAddressProperty[] = "address";
++constexpr char kServerObjectPath[] = "/com/meego/inputmethod/uiserver1";
++constexpr char kContextObjectPath[] = "/com/meego/inputmethod/inputcontext";
++
+ std::map<int, int> QtKeyToLinuxEvent = {
+   {Qt::Key_Escape, KEY_ESC},
+   {Qt::Key_Tab, KEY_TAB},
+@@ -155,8 +168,46 @@ void MaliitCallFinished(GObject* source, GAsyncResult* res, gpointer user_data)
+   }
+   ELINUX_LOG(ERROR) << "Maliit " << static_cast<const char*>(user_data)
+                     << " failed: " << error->message;
++  if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CLOSED) ||
++      g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_DISCONNECTED)) {
++    // Closing it raises "closed", which the plugin turns into a reconnect.
++    GDBusConnection* connection = g_dbus_proxy_get_connection(G_DBUS_PROXY(source));
++    if (connection && !g_dbus_connection_is_closed(connection)) {
++      g_dbus_connection_close(connection, NULL, NULL, NULL);
++    }
++  }
+   g_error_free(error);
+ }
++
++std::string MaliitServerAddress() {
++  const char* env = g_getenv(kAddressEnv);
++  if (env && env[0] != '\0') {
++    return env;
++  }
++
++  // A fresh lookup every time: a restarted server listens on a new socket.
++  GError* error = nullptr;
++  GDBusProxy* proxy = g_dbus_proxy_new_for_bus_sync(
++      G_BUS_TYPE_SESSION, G_DBUS_PROXY_FLAGS_GET_INVALIDATED_PROPERTIES, NULL,
++      kAddressBusName, kAddressObjectPath, kAddressInterface, NULL, &error);
++  if (!proxy) {
++    ELINUX_LOG(ERROR) << "Unable to find Maliit bus address: "
++                      << (error ? error->message : "unknown error");
++    g_clear_error(&error);
++    return std::string();
++  }
++
++  std::string address;
++  GVariant* property = g_dbus_proxy_get_cached_property(proxy, kAddressProperty);
++  if (property) {
++    if (g_variant_is_of_type(property, G_VARIANT_TYPE_STRING)) {
++      address = g_variant_get_string(property, NULL);
++    }
++    g_variant_unref(property);
++  }
++  g_object_unref(proxy);
++  return address;
++}
+ }  // namespace
+ 
+ void TextInputPlugin::OnKeyPressed(uint32_t keycode, uint32_t code_point) {
+@@ -207,6 +258,12 @@ void TextInputPlugin::DispatchEvent() {
+   for (int i = 0; i < 16 && g_main_context_iteration(glib_ctx_, FALSE); i++) {
+   }
+ 
++  if (connection_lost_ ||
++      (maliit_bus_ && g_dbus_connection_is_closed(maliit_bus_))) {
++    MaliitDropConnection(true);
++    ScheduleReconnect();
++  }
++
+   FlushSurrounding();
+ }
+ 
+@@ -249,10 +306,10 @@ TextInputPlugin::~TextInputPlugin() {
+   // completion callback into an object that is going away.
+   active_model_ = nullptr;
+   CancelDeferredHide();
++  CancelReconnect();
+   MaliitReleaseContext();
+ 
+-  g_clear_object(&maliit_context_);
+-  g_clear_object(&maliit_server_);
++  MaliitDropConnection(false);
+   g_main_context_pop_thread_default(glib_ctx_);
+   g_main_loop_unref(glib_loop_);
+   g_main_context_unref(glib_ctx_);
+@@ -370,10 +427,35 @@ void TextInputPlugin::HandleMethodCall(
+     if (base == -1 && extent == -1) {
+       base = extent = 0;
+     }
+-    active_model_->SetText(text->value.GetString());
++    // Compare before SetText: it clears the selection. An unchanged echo must
++    // not reset, or the word still being typed is dropped.
++    const std::string new_text = text->value.GetString();
++    const TextRange old_selection = active_model_->selection();
++    const std::string old_text = active_model_->GetText();
++    const bool text_changed = old_text != new_text;
++    const bool selection_changed =
++        base < 0 || extent < 0 ||
++        old_selection.base() != static_cast<size_t>(base) ||
++        old_selection.extent() != static_cast<size_t>(extent);
++    // Drop a Maliit preedit first. SetText used to leave composing_ set, so a
++    // tap in the middle of the field could not move the caret and the next
++    // space was inserted at the start (copying the rest of the message there).
++    // EndComposing keeps the characters; Flutter's text already includes them.
++    if (active_model_->composing()) {
++      active_model_->EndComposing();
++    }
++    active_model_->SetText(new_text);
+     active_model_->SetSelection(TextRange(base, extent));
+-    // Flutter is the source of truth for the field; report it to Maliit.
++    if (text_changed || selection_changed) {
++      // The keyboard still holds the last word. Reset it before the surrounding
++      // update: clearPreedit() wipes the keyboard's copy of the field, and the
++      // update that follows puts the new caret back.
++      MaliitAbandonPreedit();
++    }
++    // Flutter is the source of truth for the field; report it to Maliit
++    // before the next key, not on the following frame.
+     surrounding_dirty_ = true;
++    FlushSurrounding();
+   } else {
+     result->NotImplemented();
+     return;
+@@ -718,6 +800,16 @@ gboolean TextInputPlugin::MaliitHandleSetLanguage(
+   return TRUE;
+ }
+ 
++gboolean TextInputPlugin::MaliitHandlePluginSettingsLoaded(
++    MaliitContext* obj,
++    GDBusMethodInvocation* invocation,
++    GVariant* plugins G_GNUC_UNUSED,
++    gpointer user_data G_GNUC_UNUSED)
++{
++  maliit_context_complete_plugin_settings_loaded(obj, invocation);
++  return TRUE;
++}
++
+ gboolean TextInputPlugin::MaliitHandleNotifyExtendedAttributeChanged(
+     MaliitContext* obj,
+     GDBusMethodInvocation* invocation,
+@@ -786,7 +878,13 @@ void TextInputPlugin::ApplyReplacement(int start, int length) {
+ 
+ void TextInputPlugin::MaliitShowInputMethod() {
+   if (!maliit_server_) {
+-    return;
++    // A tap on the field is the user asking for the keyboard; do not make them
++    // wait for the next retry.
++    if (!MaliitReconnect(false)) {
++      ScheduleReconnect();
++      return;
++    }
++    CancelReconnect();
+   }
+ 
+   CancelDeferredHide();
+@@ -877,6 +975,18 @@ void TextInputPlugin::MaliitReset() {
+   maliit_server_call_reset(maliit_server_, NULL, MaliitResetFinished, this);
+ }
+ 
++void TextInputPlugin::MaliitAbandonPreedit() {
++  if (!maliit_server_) {
++    return;
++  }
++
++  // Always count the reset. MaliitReset() skips pending_resets_ when local
++  // composing_ is already false, which is exactly the caret-move case: the
++  // flag was cleared here while the keyboard still has the word.
++  pending_resets_++;
++  maliit_server_call_reset(maliit_server_, NULL, MaliitResetFinished, this);
++}
++
+ void TextInputPlugin::MaliitReleaseContext() {
+   if (!maliit_server_) {
+     return;
+@@ -1042,31 +1152,54 @@ void TextInputPlugin::InitMaliitConnection() {
+ 
+   ELINUX_LOG(INFO) << "Initializing Maliit connection";
+ 
+-  maliit_server_ = nullptr;
+-  maliit_context_ = nullptr;
++  // A keyboard that is not up yet is picked up by the first show.
++  MaliitConnect();
++}
+ 
+-  GError *error = NULL;
+-  maliit_server_ = maliit_get_server_sync(NULL, &error);
+-  if (maliit_server_) {
+-      g_object_ref(maliit_server_);
+-      g_signal_connect(maliit_server_, "invoke-action", G_CALLBACK(maliit_im_invoke_action), this);
+-      // toolbarId 0 in the widget state refers to this extension; the action
+-      // key can be overridden through it.
+-      maliit_server_call_register_attribute_extension(
+-          maliit_server_, 0, "", NULL, MaliitCallFinished,
+-          const_cast<char*>("registerAttributeExtension"));
+-  } else {
+-      // libmaliit-glib returns NULL without an error when the server address
+-      // property is missing, which is the normal "no keyboard here" case.
+-      ELINUX_LOG(ERROR) << "Unable to connect to Maliit server: "
+-                        << (error ? error->message : "no server address");
+-      g_clear_error(&error);
+-      return;
++bool TextInputPlugin::MaliitConnect() {
++  std::string address = MaliitServerAddress();
++  if (address.empty()) {
++    // The normal "no keyboard here" case, or the server is restarting.
++    ELINUX_LOG(ERROR) << "Unable to connect to Maliit server: no server address";
++    return false;
+   }
+ 
+-  maliit_context_ = maliit_get_context_sync(NULL, &error);
+-  if (maliit_context_) {
+-      g_object_ref(maliit_context_);
++  GError* error = nullptr;
++  GDBusConnection* bus = g_dbus_connection_new_for_address_sync(
++      address.c_str(), G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT, NULL,
++      NULL, &error);
++  if (!bus) {
++    ELINUX_LOG(ERROR) << "Unable to connect to Maliit server: "
++                      << (error ? error->message : "unknown error");
++    g_clear_error(&error);
++    return false;
++  }
++
++  MaliitServer* server = maliit_server_proxy_new_sync(
++      bus, G_DBUS_PROXY_FLAGS_GET_INVALIDATED_PROPERTIES, NULL,
++      kServerObjectPath, NULL, &error);
++  if (!server) {
++    ELINUX_LOG(ERROR) << "Unable to connect to Maliit server: "
++                      << (error ? error->message : "unknown error");
++    g_clear_error(&error);
++    g_dbus_connection_close(bus, NULL, NULL, NULL);
++    g_object_unref(bus);
++    return false;
++  }
++
++  maliit_bus_ = bus;
++  maliit_server_ = server;
++  maliit_context_ = maliit_context_skeleton_new();
++  closed_handler_ = g_signal_connect(maliit_bus_, "closed",
++                                     G_CALLBACK(MaliitConnectionClosed), this);
++  g_signal_connect(maliit_server_, "invoke-action",
++                   G_CALLBACK(maliit_im_invoke_action), this);
++
++  {
++      // The skeleton is ours, not libmaliit-glib's, so nothing else completes
++      // this one.
++      g_signal_connect(maliit_context_, "handle-plugin-settings-loaded",
++                          G_CALLBACK(MaliitHandlePluginSettingsLoaded), this);
+       g_signal_connect(maliit_context_, "handle-activation-lost-event",
+                           G_CALLBACK(MaliitHandleActivationLostEvent), this);
+       g_signal_connect(maliit_context_, "handle-im-initiated-hide",
+@@ -1095,13 +1228,125 @@ void TextInputPlugin::InitMaliitConnection() {
+                           G_CALLBACK(MaliitHandleSetLanguage), this);
+       g_signal_connect(maliit_context_, "handle-notify-extended-attribute-changed",
+                           G_CALLBACK(MaliitHandleNotifyExtendedAttributeChanged), this);
+-      // handle-plugin-settings-loaded is left to libmaliit-glib, which
+-      // completes it itself.
+-  } else {
+-      ELINUX_LOG(ERROR) << "Unable to connect to Maliit context: "
+-                        << (error ? error->message : "no server address");
+-      g_clear_error(&error);
+   }
++
++  if (!g_dbus_interface_skeleton_export(
++          G_DBUS_INTERFACE_SKELETON(maliit_context_), maliit_bus_,
++          kContextObjectPath, &error)) {
++    ELINUX_LOG(ERROR) << "Unable to export Maliit context: "
++                      << (error ? error->message : "unknown error");
++    g_clear_error(&error);
++    MaliitDropConnection(false);
++    return false;
++  }
++
++  // toolbarId 0 in the widget state refers to this extension; the action
++  // key can be overridden through it.
++  maliit_server_call_register_attribute_extension(
++      maliit_server_, 0, "", NULL, MaliitCallFinished,
++      const_cast<char*>("registerAttributeExtension"));
++  return true;
++}
++
++void TextInputPlugin::MaliitDropConnection(bool notify_view) {
++  connection_lost_ = false;
++  if (!maliit_bus_) {
++    return;
++  }
++
++  CancelDeferredHide();
++  if (maliit_context_) {
++    g_signal_handlers_disconnect_by_data(maliit_context_, this);
++    g_dbus_interface_skeleton_unexport(
++        G_DBUS_INTERFACE_SKELETON(maliit_context_));
++    g_clear_object(&maliit_context_);
++  }
++  if (maliit_server_) {
++    g_signal_handlers_disconnect_by_data(maliit_server_, this);
++    g_clear_object(&maliit_server_);
++  }
++  if (closed_handler_) {
++    g_signal_handler_disconnect(maliit_bus_, closed_handler_);
++    closed_handler_ = 0;
++  }
++  if (!g_dbus_connection_is_closed(maliit_bus_)) {
++    g_dbus_connection_close(maliit_bus_, NULL, NULL, NULL);
++  }
++  g_clear_object(&maliit_bus_);
++
++  // A new server knows nothing about this client.
++  im_active_ = false;
++  focus_reported_ = false;
++  pending_resets_ = 0;
++  if (notify_view && delegate_) {
++    delegate_->UpdateVirtualKeyboardArea(0, 0, 0, 0);
++  }
++}
++
++bool TextInputPlugin::MaliitReconnect(bool restore) {
++  ELINUX_LOG(WARNING) << "Maliit reconnect attempt " << reconnect_attempts_;
++  if (!MaliitConnect()) {
++    return false;
++  }
++  ELINUX_LOG(WARNING) << "Maliit reconnected";
++  reconnect_attempts_ = 0;
++  if (restore && keyboard_shown_ && active_model_) {
++    focus_changed_ = true;
++    MaliitShowInputMethod();
++  }
++  return true;
++}
++
++void TextInputPlugin::ScheduleReconnect() {
++  if (reconnect_timer_ || maliit_bus_) {
++    return;
++  }
++  reconnect_attempts_ = 0;
++  GSource* source = g_timeout_source_new(kReconnectDelayMs);
++  g_source_set_callback(source, MaliitReconnectTimeout, this, nullptr);
++  reconnect_timer_ = g_source_attach(source, glib_ctx_);
++  g_source_unref(source);
++}
++
++void TextInputPlugin::CancelReconnect() {
++  if (!reconnect_timer_) {
++    return;
++  }
++  GSource* source =
++      g_main_context_find_source_by_id(glib_ctx_, reconnect_timer_);
++  if (source) {
++    g_source_destroy(source);
++  }
++  reconnect_timer_ = 0;
++}
++
++gboolean TextInputPlugin::MaliitReconnectTimeout(gpointer user_data) {
++  auto self = reinterpret_cast<TextInputPlugin*>(user_data);
++  self->reconnect_attempts_++;
++  if (self->MaliitReconnect(true)) {
++    self->reconnect_timer_ = 0;
++    return G_SOURCE_REMOVE;
++  }
++  if (self->reconnect_attempts_ >= kMaxReconnectAttempts) {
++    // Tapping the field still tries again.
++    ELINUX_LOG(WARNING) << "Maliit reconnect gave up";
++    self->reconnect_timer_ = 0;
++    return G_SOURCE_REMOVE;
++  }
++  return G_SOURCE_CONTINUE;
++}
++
++void TextInputPlugin::MaliitConnectionClosed(GDBusConnection* connection G_GNUC_UNUSED,
++                                             gboolean remote_peer_vanished,
++                                             GError* error,
++                                             gpointer user_data) {
++  auto self = reinterpret_cast<TextInputPlugin*>(user_data);
++  ELINUX_LOG(WARNING) << "Maliit connection closed"
++                      << (remote_peer_vanished ? " by the server" : "") << ": "
++                      << (error ? error->message : "no error");
++  // Dropping the connection inside its own signal is not safe; DispatchEvent()
++  // does it once the iteration returns.
++  self->connection_lost_ = true;
+ }
+ 
+ }  // namespace flutter
+diff --git a/src/flutter/shell/platform/linux_embedded/plugins/text_input_plugin.h b/src/flutter/shell/platform/linux_embedded/plugins/text_input_plugin.h
+index d99fe72..5ee59fa 100644
+--- a/src/flutter/shell/platform/linux_embedded/plugins/text_input_plugin.h
++++ b/src/flutter/shell/platform/linux_embedded/plugins/text_input_plugin.h
+@@ -50,6 +50,28 @@ class TextInputPlugin {
+ 
+   void InitMaliitConnection();
+ 
++  // Opens a private connection to the server and exports the context on it.
++  // libmaliit-glib's maliit_get_*_sync() cache theirs for the life of the
++  // process and never notice it closing, so a keyboard restart would leave
++  // them talking to a dead socket.
++  bool MaliitConnect();
++
++  // Forgets the connection and everything the server knew about this client.
++  // |keyboard_shown_| and |active_model_| stay so the panel can be restored.
++  void MaliitDropConnection(bool notify_view);
++
++  // Connects again; with |restore| the panel comes back if Flutter still
++  // wants it.
++  bool MaliitReconnect(bool restore);
++  void ScheduleReconnect();
++  void CancelReconnect();
++
++  static void MaliitConnectionClosed(GDBusConnection* connection,
++                                     gboolean remote_peer_vanished,
++                                     GError* error,
++                                     gpointer user_data);
++  static gboolean MaliitReconnectTimeout(gpointer user_data);
++
+   // Context interface. All of it is handled: a handler that returns TRUE stops
+   // the emission, so a method left unconnected - or completed late - hangs the
+   // server's call until D-Bus times it out 25s later. Every handler completes
+@@ -137,6 +159,12 @@ class TextInputPlugin {
+                                           const gchar* language,
+                                           gpointer user_data);
+ 
++  static gboolean MaliitHandlePluginSettingsLoaded(
++      MaliitContext* obj,
++      GDBusMethodInvocation* invocation,
++      GVariant* plugins,
++      gpointer user_data);
++
+   static gboolean MaliitHandleNotifyExtendedAttributeChanged(
+       MaliitContext* obj,
+       GDBusMethodInvocation* invocation,
+@@ -167,6 +195,13 @@ class TextInputPlugin {
+   // already in flight are ignored until the reset completes.
+   void MaliitReset();
+ 
++  // Drops the keyboard's preedit without touching the field. Used when Flutter
++  // moves the caret: the server can still hold the last word after local
++  // composing_ has been cleared, and the next backspace or space would insert
++  // it at the new caret. Commits and preedits already in flight are ignored
++  // until the reset is acknowledged.
++  void MaliitAbandonPreedit();
++
+   // reset + focusState:false + hide. This is the only way to tell the server
+   // that nothing accepts input any more.
+   void MaliitReleaseContext();
+@@ -245,8 +280,17 @@ class TextInputPlugin {
+   // GLib source id of the deferred hide, 0 when none is armed.
+   guint hide_timer_ = 0;
+ 
++  // GLib source id of the reconnect retry, 0 when none is armed.
++  guint reconnect_timer_ = 0;
++  int reconnect_attempts_ = 0;
++
++  // Set by the bus "closed" signal; acted on once the iteration is done.
++  bool connection_lost_ = false;
++
+   GMainContext *glib_ctx_ = nullptr;
+   GMainLoop *glib_loop_ = nullptr;
++  GDBusConnection *maliit_bus_ = nullptr;
++  gulong closed_handler_ = 0;
+   MaliitServer *maliit_server_ = nullptr;
+   MaliitContext *maliit_context_ = nullptr;
+ };
+diff --git a/src/flutter/shell/platform/linux_embedded/window/content_hub_clipboard.cc b/src/flutter/shell/platform/linux_embedded/window/content_hub_clipboard.cc
+index 9a6d4ba..039a50a 100644
+--- a/src/flutter/shell/platform/linux_embedded/window/content_hub_clipboard.cc
++++ b/src/flutter/shell/platform/linux_embedded/window/content_hub_clipboard.cc
+@@ -4,10 +4,16 @@
+ 
+ #include "flutter/shell/platform/linux_embedded/window/content_hub_clipboard.h"
+ 
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
+ #include <algorithm>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <string>
+ #include <vector>
+ 
+ #include "flutter/shell/platform/linux_embedded/logger.h"
+@@ -23,6 +29,7 @@ constexpr char kServiceInterface[] = "com.lomiri.content.dbus.Service";
+ constexpr char kEmptySurfaceId[] = "";
+ 
+ constexpr char kMimeTypeText[] = "text/plain";
++constexpr char kMimeTypeTextUtf8[] = "text/plain;charset=utf-8";
+ 
+ // The hub holds the pastes in memory, so answers come back right away. Keep
+ // the wait short anyway: these calls block the platform thread.
+@@ -40,21 +47,42 @@ int32_t ReadInt(const uint8_t* blob, size_t index) {
+ // A paste is a serialized QMimeData: an int32 format count, then four int32 per
+ // format (format offset, format size, data offset, data size), then the bytes
+ // they point at. Nothing in it is Qt-specific.
++//
++// Publish both plain and charset variants: Qt apps commonly request
++// text/plain;charset=utf-8 when pasting.
+ std::vector<uint8_t> SerializePaste(const std::string& text) {
+-  const std::string format = kMimeTypeText;
+-  const size_t header_size = sizeof(int32_t) * 5;
+-
+-  std::vector<uint8_t> blob(header_size + format.size() + text.size());
++  const std::string format1 = kMimeTypeText;
++  const std::string format2 = kMimeTypeTextUtf8;
++  constexpr int32_t count = 2;
++  const size_t header_size = sizeof(int32_t) * (1 + 4 * count);
++
++  size_t cursor = header_size;
++  const size_t format1_off = cursor;
++  cursor += format1.size();
++  const size_t format2_off = cursor;
++  cursor += format2.size();
++  const size_t data1_off = cursor;
++  cursor += text.size();
++  const size_t data2_off = cursor;
++  cursor += text.size();
++
++  std::vector<uint8_t> blob(cursor);
+   int32_t header[] = {
+-      1,
+-      static_cast<int32_t>(header_size),
+-      static_cast<int32_t>(format.size()),
+-      static_cast<int32_t>(header_size + format.size()),
++      count,
++      static_cast<int32_t>(format1_off),
++      static_cast<int32_t>(format1.size()),
++      static_cast<int32_t>(data1_off),
++      static_cast<int32_t>(text.size()),
++      static_cast<int32_t>(format2_off),
++      static_cast<int32_t>(format2.size()),
++      static_cast<int32_t>(data2_off),
+       static_cast<int32_t>(text.size()),
+   };
+   std::memcpy(blob.data(), header, header_size);
+-  std::memcpy(blob.data() + header[1], format.data(), format.size());
+-  std::memcpy(blob.data() + header[3], text.data(), text.size());
++  std::memcpy(blob.data() + format1_off, format1.data(), format1.size());
++  std::memcpy(blob.data() + format2_off, format2.data(), format2.size());
++  std::memcpy(blob.data() + data1_off, text.data(), text.size());
++  std::memcpy(blob.data() + data2_off, text.data(), text.size());
+   return blob;
+ }
+ 
+@@ -64,7 +92,8 @@ bool ParsePaste(const uint8_t* blob, size_t size, std::string* text) {
+   }
+ 
+   const int32_t count = std::min(ReadInt(blob, 0), kMaxFormatCount);
+-  if (count <= 0 || size < sizeof(int32_t) * (1 + 4 * static_cast<size_t>(count))) {
++  if (count <= 0 ||
++      size < sizeof(int32_t) * (1 + 4 * static_cast<size_t>(count))) {
+     return false;
+   }
+ 
+@@ -99,9 +128,21 @@ bool ParsePaste(const uint8_t* blob, size_t size, std::string* text) {
+   return found;
+ }
+ 
+-// content-hub labels a paste with the id of the app that made it. A click app
+-// gets one from the launcher; its AppArmor profile carries the same string, and
+-// is what the hub compares against.
++std::string CleanAppArmorLabel(std::string label) {
++  while (!label.empty() &&
++         (label.back() == '\0' || label.back() == '\n' || label.back() == ' ')) {
++    label.pop_back();
++  }
++  const size_t mode = label.find(" (");
++  if (mode != std::string::npos) {
++    label.resize(mode);
++  }
++  return label;
++}
++
++// content-hub labels a paste with the id of the app that made it. Prefer
++// APP_ID from the click launcher; fall back to the AppArmor profile (same
++// string for confined clicks).
+ std::string AppId() {
+   const char* app_id = std::getenv("APP_ID");
+   if (app_id && *app_id) {
+@@ -109,19 +150,16 @@ std::string AppId() {
+   }
+ 
+   gchar* label = nullptr;
+-  if (!g_file_get_contents("/proc/self/attr/current", &label, nullptr, nullptr)) {
++  if (!g_file_get_contents("/proc/self/attr/current", &label, nullptr,
++                           nullptr)) {
+     return "";
+   }
+ 
+-  std::string profile(label);
++  std::string profile = CleanAppArmorLabel(label);
+   g_free(label);
+-  // The label reads "profile (mode)" while a mode is set.
+-  const size_t mode = profile.find(" (");
+-  if (mode != std::string::npos) {
+-    profile.resize(mode);
+-  }
+   return profile == "unconfined" ? "" : profile;
+ }
++
+ }  // namespace
+ 
+ ContentHubClipboard::~ContentHubClipboard() {
+@@ -155,8 +193,13 @@ bool ContentHubClipboard::SetText(const std::string& text) {
+   const std::vector<uint8_t> blob = SerializePaste(text);
+   GVariant* mime_data = g_variant_new_fixed_array(
+       G_VARIANT_TYPE_BYTE, blob.data(), blob.size(), sizeof(uint8_t));
+-  const char* types[] = {kMimeTypeText, nullptr};
++  const char* types[] = {kMimeTypeText, kMimeTypeTextUtf8, nullptr};
+   const std::string app_id = AppId();
++  if (app_id.empty()) {
++    ELINUX_LOG(ERROR)
++        << "content-hub clipboard: APP_ID is empty; CreatePaste may be "
++           "refused. Launch via the click so APP_ID is set.";
++  }
+ 
+   GError* error = nullptr;
+   GVariant* reply = g_dbus_connection_call_sync(
+@@ -166,8 +209,8 @@ bool ContentHubClipboard::SetText(const std::string& text) {
+       G_VARIANT_TYPE("(b)"), G_DBUS_CALL_FLAGS_NONE, kCallTimeoutMs, nullptr,
+       &error);
+   if (!reply) {
+-    ELINUX_LOG(ERROR) << "Failed to publish the clipboard to content-hub: "
+-                      << error->message;
++    ELINUX_LOG(ERROR) << "Failed to publish the clipboard to content-hub"
++                      << " (app_id=" << app_id << "): " << error->message;
+     g_error_free(error);
+     return false;
+   }
+@@ -176,9 +219,12 @@ bool ContentHubClipboard::SetText(const std::string& text) {
+   g_variant_get(reply, "(b)", &created);
+   g_variant_unref(reply);
+   if (!created) {
+-    // Either the hub does not know about callers without a surface id, or it
+-    // does and we are not the focused app.
+-    ELINUX_LOG(ERROR) << "content-hub refused the clipboard contents.";
++    // On content-hub 2.1.0 without the Wayland PID-focus fallback, empty
++    // surface ids are always refused. A Mir helper window steals focus and
++    // still fails — do not spawn one. Needs hub with verifiedCallerIsFocused.
++    ELINUX_LOG(ERROR)
++        << "content-hub refused empty-surface CreatePaste (app_id=" << app_id
++        << ")";
+   }
+   return created;
+ }
+@@ -206,7 +252,7 @@ bool ContentHubClipboard::GetText(std::string* text) {
+   gsize size = 0;
+   auto data = static_cast<const uint8_t*>(
+       g_variant_get_fixed_array(blob, &size, sizeof(uint8_t)));
+-  const bool parsed = data && ParsePaste(data, size, text);
++  const bool parsed = data && size > 0 && ParsePaste(data, size, text);
+   g_variant_unref(blob);
+   g_variant_unref(reply);
+   return parsed;
+diff --git a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
+index e8250a2..08c05fa 100644
+--- a/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
++++ b/src/flutter/shell/platform/linux_embedded/window/elinux_window_wayland.cc
+@@ -1276,10 +1276,12 @@ void ELinuxWindowWayland::UpdateFlutterCursor(const std::string& cursor_name) {
+ }
+ 
+ std::string ELinuxWindowWayland::GetClipboardData() {
+-  // On Ubuntu Touch content-hub is the system-wide clipboard and the Wayland
+-  // selection only reaches other Wayland clients, so the hub is asked first.
+-  // Our own copies go there too, unless it turned them down.
+-  if (!own_clipboard_ || content_hub_published_) {
++  // On Ubuntu Touch content-hub is the system-wide clipboard. Always ask it
++  // first: Qt apps (Morph, Notes, …) only publish there, and after we copy
++  // locally with own_clipboard_==true we must still pick up their newer paste.
++  // Skipping the hub whenever we "own" a failed publish left FluffyChat stuck
++  // on stale in-process text.
++  {
+     std::string text;
+     if (content_hub_.GetText(&text)) {
+       return text;
+@@ -1365,7 +1367,7 @@ void ELinuxWindowWayland::SetClipboardData(const std::string& data) {
+ bool ELinuxWindowWayland::HasClipboardData() {
+   // Same order as GetClipboardData(): whatever it would return has to be what
+   // is reported here, or the framework hides the paste button over real data.
+-  if (!own_clipboard_ || content_hub_published_) {
++  {
+     std::string text;
+     if (content_hub_.GetText(&text)) {
+       return !text.empty();
+@@ -1445,25 +1447,12 @@ void ELinuxWindowWayland::WlRegistryHandler(wl_registry* wl_registry,
+     return;
+   }
+ 
+-  if (!strcmp(interface, kZwpTextInputManagerV1)) {
+-    if (view_properties_.use_onscreen_keyboard) {
+-      constexpr uint32_t kMaxVersion = 1;
+-      zwp_text_input_manager_v1_ =
+-          static_cast<decltype(zwp_text_input_manager_v1_)>(wl_registry_bind(
+-              wl_registry, name, &zwp_text_input_manager_v1_interface,
+-              kMaxVersion));
+-    }
+-    return;
+-  }
+-
+-  if (!strcmp(interface, kZwpTextInputManagerV3)) {
+-    if (view_properties_.use_onscreen_keyboard) {
+-      constexpr uint32_t kMaxVersion = 1;
+-      zwp_text_input_manager_v3_ =
+-          static_cast<decltype(zwp_text_input_manager_v3_)>(wl_registry_bind(
+-              wl_registry, name, &zwp_text_input_manager_v3_interface,
+-              std::min(kMaxVersion, version)));
+-    }
++  if (!strcmp(interface, kZwpTextInputManagerV1) ||
++      !strcmp(interface, kZwpTextInputManagerV3)) {
++    // Maliit-glib owns the OSK on Ubuntu Touch. Binding zwp_text_input as well
++    // feeds a dummy surrounding string (" ") and, on space, a second commit
++    // that only takes text[0] — that is what duplicated half the composer
++    // when inserting a space in the middle of a message.
+     return;
+   }
+ 

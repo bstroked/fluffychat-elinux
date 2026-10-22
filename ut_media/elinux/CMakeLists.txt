@@ -8,6 +8,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(PULSE REQUIRED libpulse libpulse-simple)
 pkg_check_modules(OPUS REQUIRED opus)
 pkg_check_modules(GLIB REQUIRED glib-2.0 gio-2.0)
+pkg_check_modules(GST REQUIRED gstreamer-1.0)
 pkg_check_modules(VORBISFILE vorbisfile)
 pkg_check_modules(OPUSFILE opusfile)
 
@@ -30,11 +31,14 @@ if(OPUSFILE_FOUND)
   target_link_libraries(${PLUGIN_NAME} PRIVATE ${OPUSFILE_LIBRARIES})
 endif()
 
+target_compile_definitions(${PLUGIN_NAME} PRIVATE UT_MEDIA_HAVE_GST)
+target_compile_options(${PLUGIN_NAME} PRIVATE ${GST_CFLAGS_OTHER})
 target_include_directories(${PLUGIN_NAME} PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   ${PULSE_INCLUDE_DIRS}
   ${OPUS_INCLUDE_DIRS}
   ${GLIB_INCLUDE_DIRS}
+  ${GST_INCLUDE_DIRS}
 )
 target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -46,6 +50,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   ${PULSE_LIBRARIES}
   ${OPUS_LIBRARIES}
   ${GLIB_LIBRARIES}
+  ${GST_LIBRARIES}
 )
 
 set(ut_media_bundled_libraries

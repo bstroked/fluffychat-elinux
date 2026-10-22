@@ -39,16 +39,17 @@ dependencies_target:
 - libpulse-dev
 - libvorbis-dev
 - libogg-dev
+- libgstreamer1.0-dev
 
 install_lib:
 - /usr/lib/libmaliit-glib.so.*
-- /usr/lib/*/libcontent-hub-glib.so.*
-- /usr/lib/*/libopus.so.*
+- /usr/lib/${ARCH_TRIPLET}/libcontent-hub-glib.so.*
+- /usr/lib/${ARCH_TRIPLET}/libopus.so.*
 - /usr/lib/libopusfile.so.*
 - /usr/lib/libopusurl.so.*
-- /usr/lib/*/libvorbis.so.*
-- /usr/lib/*/libvorbisfile.so.*
-- /usr/lib/*/libogg.so.*
+- /usr/lib/${ARCH_TRIPLET}/libvorbis.so.*
+- /usr/lib/${ARCH_TRIPLET}/libvorbisfile.so.*
+- /usr/lib/${ARCH_TRIPLET}/libogg.so.*
 
 build:
 - ${ROOT}/build.sh
